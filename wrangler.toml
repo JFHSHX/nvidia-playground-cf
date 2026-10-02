@@ -1,0 +1,15 @@
+name = "nvidia-playground-cf"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# hsw.js PoW solving runs inside a Dynamic Worker via the Worker Loader
+# binding below — runtime code execution without eval() (eval/new Function
+# are allowed only during the startup phase on Workers; allow_eval_during_startup
+# is default-on since 2025-06-01 but does NOT cover request handling).
+# env.LOADER.get(id, factory) caches one warm dynamic worker per hsw bundle.
+
+[[worker_loaders]]
+binding = "LOADER"
+
+[observability]
+enabled = true
