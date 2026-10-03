@@ -390,19 +390,22 @@ async function nonStreamResponse(upstream: Response): Promise<Response> {
   const text = await upstream.text();
 
   let out: Record<string, unknown> | null = null;
-  if (contentType.includes("text/event-stream")) {
-    out = aggregateSse(text);
-  } else {
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        out = parsed as Record<string, unknown>;
-      }
-    } catch {
-      out = aggregateSse(text);
+  // NVIDIA's predict returns a JSON chat.completion body with a misleading
+  // text/event-stream Content-Type, so try the JSON parse FIRST and fall
+  // back to SSE aggregation only when the body is not JSON.
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      out = parsed as Record<string, unknown>;
     }
+  } catch {
+    out = null;
   }
   if (out === null) {
+    out = aggregateSse(text);
+  }
+  if (out === null) {
+    console.error(`[npg-gw] unparseable upstream: status=${upstream.status} ct=${contentType} len=${text.length} head=${JSON.stringify(text.slice(0, 200))}`);
     return jsonError(new GatewayError(502, "upstream_error", "upstream returned an unparseable response"));
   }
   return new Response(JSON.stringify(out), {

@@ -8,7 +8,8 @@ import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { handleChatCompletions } from "../gateway/chat";
 import { MODEL_SNAPSHOT } from "../gateway/models-snapshot";
 import { setSolveOverride } from "../hcaptcha/getcaptcha";
-import { solveN, cryptoMode } from "./hsw-node";
+import { solveN as vmSolveN, cryptoMode as vmCryptoMode } from "./hsw-node";
+import { browserSolveN, browserCryptoMode } from "./browser-solver";
 
 const PORT = Number(process.env.PORT ?? 8787);
 
@@ -22,8 +23,16 @@ process.on("uncaughtException", (err) => {
   console.error(`[npg] uncaughtException: ${err.stack ?? err.message}`);
 });
 
-// Route all solver calls to the Node vm runner (must be set before any solve).
-setSolveOverride({ solveN, cryptoMode });
+// Route all solver calls to the chosen implementation (must be set before
+// any solve). The current hsw wasm traps in every embedder except a real
+// browser, so the browser solver is the default; NPG_SOLVER=vm forces the
+// node:vm runner.
+if ((process.env.NPG_SOLVER ?? "browser") === "vm") {
+  setSolveOverride({ solveN: vmSolveN, cryptoMode: vmCryptoMode });
+} else {
+  setSolveOverride({ solveN: browserSolveN, cryptoMode: browserCryptoMode });
+}
+const SOLVER_NAME = (process.env.NPG_SOLVER ?? "browser");
 
 function withCors(res: http.ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -57,7 +66,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     if (url.pathname === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", models: Object.keys(MODEL_SNAPSHOT).length, runtime: "node" }));
+      res.end(JSON.stringify({ status: "ok", models: Object.keys(MODEL_SNAPSHOT).length, runtime: "node", solver: SOLVER_NAME }));
       return;
     }
     if (url.pathname === "/v1/models") {

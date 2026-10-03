@@ -154,15 +154,34 @@ getEntries: function() { return []; },
 timing: { navigationStart: __perfT0, domContentLoadedEventEnd: __perfT0, loadEventEnd: __perfT0 }
 };
 
-// ---- timers (fire immediately, best-effort; matches the v8go shim) ----
-var setTimeout = function(fn, ms) {
+// ---- timers (v8go/workerd: fire immediately, best-effort) ----
+// GUARDED: in a real browser the window's own timers must survive — the
+// shim's fire-immediately versions would break async flows there. The bare
+// var declarations reuse the existing globals; only missing ones get the
+// shim implementations.
+var setTimeout;
+var clearTimeout;
+var setInterval;
+var clearInterval;
+var queueMicrotask;
+if (typeof setTimeout === "undefined") {
+setTimeout = function(fn, ms) {
 if (typeof fn === "function") { try { fn(); } catch (e) {} }
 return 0;
 };
-var clearTimeout = function(id) {};
-var setInterval = function() { return 0; };
-var clearInterval = function(id) {};
-var queueMicrotask = function(fn) { Promise.resolve().then(fn); };
+}
+if (typeof clearTimeout === "undefined") {
+clearTimeout = function(id) {};
+}
+if (typeof setInterval === "undefined") {
+setInterval = function() { return 0; };
+}
+if (typeof clearInterval === "undefined") {
+clearInterval = function(id) {};
+}
+if (typeof queueMicrotask === "undefined") {
+queueMicrotask = function(fn) { Promise.resolve().then(fn); };
+}
 
 // ---- navigator ----
 var navigator = {
@@ -368,9 +387,16 @@ addListener: function(){}, removeListener: function(){}, addEventListener: funct
 };
 var history = { length: 1, state: null, scrollRestoration: "auto",
 pushState: function(){}, replaceState: function(){}, back: function(){}, forward: function(){}, go: function(){} };
-var location = { href: "https://build.nvidia.com/", protocol: "https:", host: "build.nvidia.com",
+// GUARDED: window.location is [LegacyUnforgeable] in a real browser — the
+// assignment would trigger a navigation attempt and kill the script
+// ("Failed to set the 'href' property on 'Location'"). Only embedders
+// without a location get the shim's object.
+var location;
+if (typeof location === "undefined") {
+location = { href: "https://build.nvidia.com/", protocol: "https:", host: "build.nvidia.com",
 hostname: "build.nvidia.com", port: "", pathname: "/", search: "", hash: "", origin: "https://build.nvidia.com",
 assign: function(){}, replace: function(){}, reload: function(){} };
+}
 var Audio = function() {
 return { play: function(){ return Promise.resolve(); }, pause: function(){}, load: function(){},
 addEventListener: function(){}, removeEventListener: function(){}, canPlayType: function(){ return ""; },
@@ -382,8 +408,14 @@ var i = __hswEl(); i.width = w || 0; i.height = h || 0; i.src = ""; i.complete =
 i.naturalWidth = 0; i.naturalHeight = 0; i.decode = function() { return Promise.resolve(); };
 i.onload = null; i.onerror = null; return i;
 };
-var requestAnimationFrame = function(fn) { if (typeof fn === "function") { try { fn(Date.now()); } catch (e) {} } return 1; };
-var cancelAnimationFrame = function(id) {};
+var requestAnimationFrame;
+var cancelAnimationFrame;
+if (typeof requestAnimationFrame === "undefined") {
+requestAnimationFrame = function(fn) { if (typeof fn === "function") { try { fn(Date.now()); } catch (e) {} } return 1; };
+}
+if (typeof cancelAnimationFrame === "undefined") {
+cancelAnimationFrame = function(id) {};
+}
 var getSelection = function() {
 return { toString: function(){ return ""; }, rangeCount: 0, removeAllRanges: function(){},
 addRange: function(){}, collapse: function(){}, collapseToStart: function(){}, collapseToEnd: function(){} };

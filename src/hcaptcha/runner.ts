@@ -44,6 +44,46 @@ const reEmbeddedWasm = /0,\s*null,\s*"([A-Za-z0-9+/=]{200,})"/;
 /** Matches a data: URL carrying the wasm base64 (fetch.go:56). */
 const reDataWasm = /data:(?:application\/octet-stream|application\/wasm);base64,([A-Za-z0-9+/=]{200,})/;
 
+// --- sync wasm instantiation (fetch.go:252-307) ---
+
+// reInstantiateThen matches the promise-based wasm instantiate call found in
+// v1 bundles. hCaptcha renames the local variables between bundle releases
+// (e.g. "Lc=WebAssembly.instantiate(vv,afs).then(function(vv){ajz(vv)})" and
+// "NN=WebAssembly.instantiate(cl,_l).then(function(cl){xL(cl)})"), so the
+// rewrite is shape-based rather than byte-identical:
+//
+// X = WebAssembly.instantiate(bytes, imports).then(function(cb){fn(cb)})
+const reInstantiateThen = /([A-Za-z0-9_$]+)=WebAssembly\.instantiate\(([A-Za-z0-9_$]+),([A-Za-z0-9_$]+)\)\.then\(function\(([A-Za-z0-9_$]+)\)\{([A-Za-z0-9_$]+)\([A-Za-z0-9_$]+\)\}\)/;
+
+// reInstantiateBare matches the same call without the .then callback.
+const reInstantiateBare = /([A-Za-z0-9_$]+)=WebAssembly\.instantiate\(([A-Za-z0-9_$]+),([A-Za-z0-9_$]+)\)/;
+
+/** syncWasmInstantiate rewrites the promise-based instantiate call found in
+ * v1 bundles into a synchronous Module + Instance pair wrapped in an already
+ * resolved Promise, preserving the {module, instance} shape that the
+ * original then-callback receives. Returns [out, applied]. The glue's init
+ * is fire-and-forget, so the dispatcher's solve can run before the promise
+ * settles and trap the wasm — needed on workerd as much as on v8go. */
+function syncWasmInstantiate(src: string): [string, number] {
+  const m = reInstantiateThen.exec(src);
+  if (!m) return [src, 0];
+  const repl = m[1] + "=(function(){var __m=new WebAssembly.Module(" + m[2] +
+    ");var __i=new WebAssembly.Instance(__m," + m[3] +
+    ");var __r={module:__m,instance:__i};queueMicrotask(function(){" + m[5] +
+    "(__r)});return Promise.resolve(__r)})()";
+  return [src.replaceAll(m[0], repl), 1];
+}
+
+/** syncWasmInstantiateBare handles the no-then variant. */
+function syncWasmInstantiateBare(src: string): [string, number] {
+  const m = reInstantiateBare.exec(src);
+  if (!m) return [src, 0];
+  const repl = m[1] + "=(function(){var __m=new WebAssembly.Module(" + m[2] +
+    ");var __i=new WebAssembly.Instance(__m," + m[3] +
+    ");return Promise.resolve({module:__m,instance:__i})})()";
+  return [src.replaceAll(m[0], repl), 1];
+}
+
 /** A fully prepared hsw.js execution unit (fetch.go:59-67 Bundle). */
 export interface HswBundle {
   location: string;
@@ -139,6 +179,13 @@ export function prepareBundle(raw: Uint8Array): HswBundle {
     const m2 = reDataWasm.exec(patched);
     if (m2) wasm64 = m2[1]!;
   }
+
+  // NOTE: the syncWasmInstantiate patch (Go fetch.go:252-307) is deliberately
+  // NOT applied: it exists only for v8go, which never settles the promise
+  // form of WebAssembly.instantiate. workerd settles it natively, and so does
+  // Node — but workerd DISALLOWS wasm code generation from bytes
+  // ("WebAssembly.Module(): Wasm code generation disallowed by embedder"),
+  // so the constructor form breaks the workerd path. Keep the promise form.
 
   return {
     location: "",

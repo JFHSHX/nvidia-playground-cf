@@ -565,5 +565,5 @@ export async function captchaToken(sitekey: string, host: string): Promise<strin
   for (const at of attempts) {
     if (at.token !== "") return at.token;
   }
-  throw new Error(`hcaptcha: no passcode in ${attempts.length} attempts`);
+  throw new Error(`hcaptcha: no passcode in ${attempts.length} attempts: ${attempts.map((a) => `${a.name}[status=${a.status}]: ${a.err || "no token in body"}`).join("; ")}`);
 }
