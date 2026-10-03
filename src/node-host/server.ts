@@ -62,6 +62,28 @@ async function writeResponse(resp: Response, res: http.ServerResponse): Promise<
   Readable.fromWeb(resp.body as unknown as NodeWebReadableStream).pipe(res);
 }
 
+// Global chat throttle: serialize chat requests and pace them with a minimum
+// interval, because rapid programmatic solving escalates hCaptcha's adaptive
+// difficulty (observed s=4 → s=17 → 2^34 stamp search, infeasible in JS; the
+// difficulty decays after ~10-20 min of lighter use).
+const CHAT_MIN_INTERVAL_MS = Number(process.env.NPG_CHAT_INTERVAL_MS ?? 3000);
+let chatChain: Promise<unknown> = Promise.resolve();
+let lastChatDone = 0;
+
+function throttle<T>(work: () => Promise<T>): Promise<T> {
+  const run = chatChain.then(async () => {
+    const wait = lastChatDone + CHAT_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return await work();
+    } finally {
+      lastChatDone = Date.now();
+    }
+  });
+  chatChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 const server = http.createServer(async (req, res) => {
   const t0 = Date.now();
   res.on("finish", () => console.log(`req ${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - t0}ms`));
@@ -90,7 +112,7 @@ const server = http.createServer(async (req, res) => {
         headers: { "content-type": "application/json" },
         body,
       });
-      const resp = await handleChatCompletions(request);
+      const resp = await throttle(() => handleChatCompletions(request));
       await writeResponse(resp, res);
       return;
     }
