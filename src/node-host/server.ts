@@ -47,6 +47,23 @@ function errorBody(message: string, type: string, code: string): string {
   return JSON.stringify({ error: { message, type, code } });
 }
 
+/** isEmptyAssistantContent: true when a non-stream JSON response carries an
+ * assistant message with null/empty content (a thinking model that spent its
+ * whole token budget on reasoning). Reads a CLONE so the original response
+ * stays writable. */
+async function isEmptyAssistantContent(resp: Response): Promise<boolean> {
+  try {
+    const ct = resp.headers.get("content-type") ?? "";
+    if (resp.status !== 200) return false; // 错误响应不是"空 content",别浪费重试
+    if (!ct.includes("application/json")) return false; // streaming: never touched
+    const body = await resp.clone().json() as { choices?: Array<{ message?: { content?: string | null } }> };
+    const msg = body?.choices?.[0]?.message;
+    return !msg || msg.content === null || msg.content === "";
+  } catch {
+    return false;
+  }
+}
+
 async function readBody(req: http.IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -107,12 +124,21 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       const body = await readBody(req);
-      const request = new Request("http://localhost/v1/chat/completions", {
+      // 每次尝试用全新的 Request(上一次尝试已消费 request 的 body 流,
+      // 复用会得到 "invalid json body");body 字符串本身可重复使用。
+      const makeReq = () => new Request("http://localhost/v1/chat/completions", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
       });
-      const resp = await throttle(() => handleChatCompletions(request));
+      let resp = await throttle(() => handleChatCompletions(makeReq()));
+      // 思考模型(kimi-k3 等)偶发把全部 token 花在 reasoning 上,content 返回
+      // null → harness/客户端拿到空回合。检测到空 content 就换新 token 重试
+      // 一次(采样方差通常第二次就有 content)。
+      if (await isEmptyAssistantContent(resp)) {
+        console.error(`[npg] empty content in response, retrying once with a fresh token`);
+        resp = await throttle(() => handleChatCompletions(makeReq()));
+      }
       await writeResponse(resp, res);
       return;
     }
