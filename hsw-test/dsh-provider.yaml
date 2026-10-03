@@ -1,0 +1,72 @@
+    nvidia-playground:
+      baseUrl: http://localhost:8787/v1
+      apiKeyEnv: NVIDIA_PLAYGROUND_KEY
+      models:
+        - id: deepseek-ai/deepseek-v4.1-flash
+          name: deepseek-v4.1-flash
+          contextWindow: 1000000
+          maxTokens: 131072
+        - id: google/diffusiongemma-26b-a4b-it
+          name: diffusiongemma-26b-a4b-it
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: google/gemma-4-31b-it
+          name: gemma-4-31b-it
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: meta/llama-3.2-11b-vision-instruct
+          name: llama-3.2-11b-vision-instruct
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: meta/llama-3.2-90b-vision-instruct
+          name: llama-3.2-90b-vision-instruct
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: meta/muse-glimmer-30b
+          name: muse-glimmer-30b
+          contextWindow: 131072
+          maxTokens: 131072
+        - id: moonshotai/kimi-k3
+          name: kimi-k3
+          contextWindow: 1048576
+          maxTokens: 131072
+        - id: nvidia/ising-calibration-1-35b-a3b
+          name: ising-calibration-1-35b-a3b
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: nvidia/ising-calibration-1.5-31b
+          name: ising-calibration-1.5-31b
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+          name: nemotron-3-nano-omni-30b-a3b-reasoning
+          contextWindow: 256000
+          maxTokens: 65536
+        - id: nvidia/nemotron-3-super-120b-a12b
+          name: nemotron-3-super-120b-a12b
+          contextWindow: 262144
+          maxTokens: 262144
+        - id: nvidia/nemotron-3-ultra-550b-a55b
+          name: nemotron-3-ultra-550b-a55b
+          contextWindow: 1000000
+          maxTokens: 65536
+        - id: nvidia/nemotron-3.5-lightning-30b-a3b
+          name: nemotron-3.5-lightning-30b-a3b
+          contextWindow: 262144
+          maxTokens: 262144
+        - id: openai/gpt-oss-20b
+          name: gpt-oss-20b
+          contextWindow: 131072
+          maxTokens: 32768
+        - id: poolside/laguna-xs-2.1
+          name: laguna-xs-2.1
+          contextWindow: 262144
+          maxTokens: 16384
+        - id: z-ai/glm-5-3
+          name: glm-5-3
+          contextWindow: 131072
+          maxTokens: 16384
+        - id: z-ai/glm-5-3-flash
+          name: glm-5-3-flash
+          contextWindow: 131072
+          maxTokens: 16384
