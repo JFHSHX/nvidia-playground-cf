@@ -355,10 +355,22 @@ export async function captchaAttempts(sitekey: string, host: string): Promise<[s
     // Encrypted-only fast path: adopt the speculative claim (or claim fresh
     // if it failed) and skip the plaintext variants (getcaptcha.go:365-376).
     const claim = await claimP;
-    const pclaim: GcHttpResult | null = claim.err === "" ? claim : null;
-    const [at, info] = await runEncryptedAttempt(sitekey, host, pclaim);
+    let pclaim: GcHttpResult | null = claim.err === "" ? claim : null;
+    const attempts: CaptchaAttempt[] = [];
+    let info: SolveInfo = { jwt: "", location: "", key: "", fingerprint: "", n: "", elapsedMs: 0 };
+    // The claimed challenge's difficulty is the server's choice and can spike
+    // (observed s=17 → 2^34 stamp search — infeasible in JS at ~293K hash/s).
+    // A spiked challenge is abandoned and a fresh one claimed, up to 3 rounds;
+    // most challenges carry a small difficulty (s=4 → 8 bits → trivial).
+    for (let round = 0; round < 3; round++) {
+      const [at, inf] = await runEncryptedAttempt(sitekey, host, pclaim);
+      attempts.push(at);
+      info = inf;
+      if (at.token !== "") break;
+      pclaim = null; // abandon the (possibly spiked) challenge, claim fresh
+    }
     info.elapsedMs = Date.now() - start;
-    return [info, [at]];
+    return [info, attempts];
   }
 
   // Legacy route: discard the speculative claim and solve the challenge for
