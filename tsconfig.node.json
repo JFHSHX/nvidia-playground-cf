@@ -1,0 +1,4 @@
+// tsconfig.node.json — type-checks the Node host (src/node-host) with node
+// types instead of @cloudflare/workers-types (the two declare conflicting
+// Request/Response globals). Run: tsc --noEmit -p tsconfig.node.json
+{"compilerOptions": {"target": "ES2022", "lib": ["ES2022"], "module": "ESNext", "moduleResolution": "bundler", "types": ["node"], "strict": true, "noEmit": true, "skipLibCheck": true, "isolatedModules": true, "forceConsistentCasingInFileNames": true}, "include": ["src/node-host"]}

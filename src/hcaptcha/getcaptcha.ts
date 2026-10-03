@@ -16,8 +16,29 @@
 // All solver/network phases are async (TS), unlike the Go sync http client.
 import { parsePow } from "./pow";
 import { buildFingerprint } from "./fingerprint";
-import { solveN, cryptoMode, locationFromJWT, HSW_UA } from "./runner";
+import { solveN as solveNWorkerd, cryptoMode as cryptoModeWorkerd, locationFromJWT, HSW_UA } from "./runner";
 import { msgpackDecode, msgpackEncodeMapString, msgpackEncodeWire } from "./msgpack";
+
+/** Solver override: a Node host (src/node-host) injects its own vm-based
+ * runner at startup; when unset the workerd Worker Loader path is used. */
+let solveOverride: {
+  solveN(location: string, jwt: string, fpB64: string): Promise<string>;
+  cryptoMode(location: string, mode: number, data: Uint8Array): Promise<Uint8Array>;
+} | null = null;
+
+/** setSolveOverride routes all solver calls to the given implementation
+ * (used by the Node host; must be called before any solve starts). */
+export function setSolveOverride(o: NonNullable<typeof solveOverride>): void {
+  solveOverride = o;
+}
+
+function solveN(location: string, jwt: string, fpB64: string): Promise<string> {
+  return solveOverride ? solveOverride.solveN(location, jwt, fpB64) : solveNWorkerd(location, jwt, fpB64);
+}
+
+function cryptoMode(location: string, mode: number, data: Uint8Array): Promise<Uint8Array> {
+  return solveOverride ? solveOverride.cryptoMode(location, mode, data) : cryptoModeWorkerd(location, mode, data);
+}
 
 /** The hCaptcha endpoint that issues challenges and, given a solved challenge,
  * a passcode (getcaptcha.go:34). */

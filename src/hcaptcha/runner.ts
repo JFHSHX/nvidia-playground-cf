@@ -18,7 +18,6 @@
 //   outbound access from the dynamic worker).
 import { buildShim } from "./shim";
 import { ASSET_BASE } from "./fingerprint";
-import { env } from "cloudflare:workers";
 
 /** Where hCaptcha serves hsw.js and challenge assets (hsw.go:32). */
 export { ASSET_BASE };
@@ -182,7 +181,7 @@ interface WorkerLoaderBinding {
 /** The dispatcher appended to the prepared bundle inside the dynamic worker:
  * solve -> hsw(jwt, fp); crypto -> hsw(mode, bytes). Responses are JSON:
  * {ok:true,n} / {ok:true,b64} / {ok:false,error}. */
-const DISPATCHER = `
+export const DISPATCHER = `
 function __b64ToBytes(b64) {
 var bin = atob(b64);
 var u = new Uint8Array(bin.length);
@@ -215,7 +214,8 @@ return new Response(JSON.stringify({ ok: false, error: String((e && e.message) |
 
 /** LOADER binding access via cloudflare:workers (no contract change for
  * acquireNvCaptcha; only callable inside a request context). */
-function getLoader(): WorkerLoaderBinding {
+async function getLoader(): Promise<WorkerLoaderBinding> {
+  const { env } = await import("cloudflare:workers");
   const loader = (env as unknown as { LOADER?: WorkerLoaderBinding }).LOADER;
   if (!loader) {
     throw new Error('hsw: LOADER binding missing (add [[worker_loaders]] binding = "LOADER" to wrangler.toml)');
@@ -234,7 +234,7 @@ function solverStub(location: string): Promise<WorkerLoaderStub> {
   const cached = solverCache.get(location);
   if (cached) return cached;
   const p = (async () => {
-    return getLoader().get("hsw:" + location, async () => {
+    return (await getLoader()).get("hsw:" + location, async () => {
       const bundle = await loadBundle(location);
       return {
         compatibilityDate: DYN_COMPAT_DATE,

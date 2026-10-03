@@ -1,2 +1,2 @@
 // tsconfig for nvidia-playground-cf (JSONC — comments accepted by tsc)
-{"compilerOptions": {"target": "ES2022", "lib": ["ES2022"], "module": "ESNext", "moduleResolution": "bundler", "types": ["@cloudflare/workers-types"], "strict": true, "noEmit": true, "skipLibCheck": true, "isolatedModules": true, "forceConsistentCasingInFileNames": true}, "include": ["src/**/*.ts"]}
+{"compilerOptions": {"target": "ES2022", "lib": ["ES2022"], "module": "ESNext", "moduleResolution": "bundler", "types": ["@cloudflare/workers-types"], "strict": true, "noEmit": true, "skipLibCheck": true, "isolatedModules": true, "forceConsistentCasingInFileNames": true}, "include": ["src/**/*.ts"], "exclude": ["src/node-host"]}
