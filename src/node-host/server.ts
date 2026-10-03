@@ -10,6 +10,9 @@ import { MODEL_SNAPSHOT } from "../gateway/models-snapshot";
 import { setSolveOverride } from "../hcaptcha/getcaptcha";
 import { solveN as vmSolveN, cryptoMode as vmCryptoMode } from "./hsw-node";
 import { browserSolveN, browserCryptoMode } from "./browser-solver";
+import { initFileLog } from "./logger";
+
+initFileLog();
 
 const PORT = Number(process.env.PORT ?? 8787);
 
@@ -60,6 +63,8 @@ async function writeResponse(resp: Response, res: http.ServerResponse): Promise<
 }
 
 const server = http.createServer(async (req, res) => {
+  const t0 = Date.now();
+  res.on("finish", () => console.log(`req ${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - t0}ms`));
   const url = new URL(req.url ?? "/", "http://localhost");
   withCors(res);
   try {
