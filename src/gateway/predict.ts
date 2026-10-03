@@ -296,13 +296,11 @@ export async function doPredict(
 
     if (resp.status < 400) return resp;
 
-    // 读错误体(限 4KB)后关闭
+    // 读错误体(限 4KB)。text() 已消费并关闭 body——**不要调用 body.cancel()**:
+    // Node webstreams 中已锁定的流 cancel 会抛 ERR_INVALID_STATE(ReadableStream
+    // is locked),其 Promise rejection 还会成为未处理拒绝;Go 版 CloseBody 的
+    // "close failure has no effect" 语义在这里不适用。
     const raw = await resp.text();
-    try {
-      resp.body?.cancel();
-    } catch {
-      // 忽略
-    }
     lastUpstreamMessage = raw;
 
     if (isRetryableCaptchaFailure(resp.status, raw) && attempt < maxAttempts) {

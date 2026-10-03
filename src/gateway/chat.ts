@@ -13,7 +13,7 @@ import {
 } from "./predict";
 
 const acquire: AcquireCaptcha = acquireNvCaptcha; // 只消费 captchaToken 字段
-const NON_STREAM_TIMEOUT_MS = 120_000; // client.go requestTimeout
+const NON_STREAM_TIMEOUT_MS = 300_000; // 5min: NVCF 冷启动(模型实例拉起)可达数分钟,120s 会把冷启动的首次请求杀成 504
 
 // --- thinking / chat_template_kwargs(reasoning.go normalizeThinking) ---
 
