@@ -16,6 +16,10 @@ export interface ModelInfo {
   namespace: string;
   /** nv-function-id 头值(每模型 UUID) */
   functionId: string;
+  /** 上游 body 里 model 字段的名字;URL slug 与它可能不同(glm-5-3 的 body
+   * 用 "z-ai/glm-5.3" 带点,实测用 slug 会 500 "Retries exhausted");缺省
+   * 等于模型 id */
+  model?: string;
 }
 
 export const MODEL_SNAPSHOT: Record<string, ModelInfo> = {
@@ -98,10 +102,12 @@ export const MODEL_SNAPSHOT: Record<string, ModelInfo> = {
     slug: "glm-5-3",
     namespace: "qc69jvmznzxy",
     functionId: "0cd5c583-435c-4649-a621-f4e421fa12a0",
+    model: "z-ai/glm-5.3",
   },
   "z-ai/glm-5-3-flash": {
     slug: "glm-5-3-flash",
     namespace: "qc69jvmznzxy",
     functionId: "f7e3a881-2cde-455d-bbfd-fb8eb1bd1520",
+    model: "z-ai/glm-5.3-flash",
   },
 };

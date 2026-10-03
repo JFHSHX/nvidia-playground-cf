@@ -1,40 +1,51 @@
 // scripts/probe-glm-invoke.ts — loads glm-5-3's playground in a REAL headed
-// Chromium, sends a message, and captures every nvcf/predict/chat network
-// request to reveal what the page's own widget actually invokes (the user
-// verified glm-5-3 works anonymously in the browser UI — our predict call
-// got 404, so the page must use a different invocation shape).
+// Chromium, sends a message via the chat textarea, and captures EVERY POST
+// request + its response body, to reveal the page's real invocation.
 // Run: npx tsx scripts/probe-glm-invoke.ts
 import { chromium } from "playwright";
 
 const browser = await chromium.launch({ headless: false });
 const page = await browser.newPage();
-const reqs: string[] = [];
+const posts: Array<{ url: string; status?: number; body?: string }> = [];
 
 page.on("request", (r) => {
-  const u = r.url();
-  if (/nvcf|predict|chat\/completions|hcaptcha|buildapi/.test(u)) {
-    reqs.push(`${r.method()} ${u}`);
+  if (r.method() === "POST" && !/_next|hcaptcha\.com\/c\/|\.css|\.png|\.woff/.test(r.url())) {
+    posts.push({ url: r.url() });
   }
 });
-page.on("response", (r) => {
-  const u = r.url();
-  if (/nvcf|predict|buildapi/.test(u)) {
-    console.log(`RESP ${r.status()} ${r.request().method()} ${u.slice(0, 140)}`);
+page.on("response", async (r) => {
+  if (r.request().method() !== "POST" || /hcaptcha\.com\/c\//.test(r.url())) return;
+  const entry = posts.find((p) => p.url === r.url() && p.status === undefined);
+  if (entry) {
+    entry.status = r.status();
+    try {
+      entry.body = (await r.text()).slice(0, 500);
+    } catch {
+      entry.body = "(body unavailable)";
+    }
   }
 });
 
 await page.goto("https://build.nvidia.com/z-ai/glm-5-3/playground", { waitUntil: "domcontentloaded", timeout: 60000 });
-console.log("page loaded; waiting for the widget to settle...");
+console.log("page loaded");
 await page.waitForTimeout(8000);
 
-// The chat input: .chat-text-input contains a textarea or input (v3 layout).
-const box = page.locator(".chat-text-input textarea, .chat-text-input input").first();
-await box.click();
-await box.fill("hi");
+// Find the chat input: a plain textarea, else a contenteditable.
+let box = page.locator("textarea").first();
+if ((await box.count()) === 0) {
+  box = page.locator("[contenteditable='true']").first();
+}
+console.log("input found:", await box.count());
+await box.click({ timeout: 15000 }).catch((e) => console.log("click failed:", e.message.slice(0, 120)));
+await box.fill("hi").catch((e) => console.log("fill failed:", e.message.slice(0, 120)));
 await page.keyboard.press("Enter");
-console.log("message sent; waiting for the invocation...");
+console.log("message sent");
 await page.waitForTimeout(25000);
 
-console.log(`\ncaptured ${reqs.length} matching requests (last 25):`);
-reqs.slice(-25).forEach((r) => console.log("  " + r));
+console.log(`\ncaptured ${posts.length} POSTs:`);
+posts.forEach((p, i) => {
+  console.log(`\n[${i}] ${p.url}`);
+  console.log(`    status: ${p.status ?? "?"}`);
+  if (p.body) console.log(`    body: ${JSON.stringify(p.body.slice(0, 300))}`);
+});
 await browser.close();

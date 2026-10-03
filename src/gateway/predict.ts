@@ -126,13 +126,13 @@ export function resolveInvokeTarget(
       if (!validFunctionID(hdr)) throw invalidFunctionIDError(hdr);
       out = { ...info, functionId: hdr };
     }
-    return { info: out, canonical: model };
+    return { info: out, canonical: out.model ?? model };
   }
 
   // 有 body pin
   const info = lookupModel(base);
   if (info !== null) {
-    return { info: { ...info, functionId: pin }, canonical: base };
+    return { info: { ...info, functionId: pin }, canonical: info.model ?? base };
   }
   // pin 指向未列模型:合成 triple
   if (!validSlugRef(base)) {
