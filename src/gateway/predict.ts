@@ -228,6 +228,7 @@ export interface PredictHeaders {
   "nv-captcha-token": string;
   Origin: string;
   Referer: string;
+  [key: string]: string;
 }
 
 export function buildPredictHeaders(info: ModelInfo, token: string): PredictHeaders {
