@@ -280,6 +280,8 @@ interface ChatCompletionRequest {
 function jsonError(err: unknown): Response {
   const body = JSON.stringify(openAIErrorBody(err));
   const status = err instanceof GatewayError ? err.status : 400;
+  // 把错误体进日志:401/502 的上游原因需要完整记录才能诊断间歇性失败。
+  console.error(`[npg-gw] error ${status}: ${body}`);
   return new Response(body, {
     status,
     headers: { "Content-Type": "application/json" },
