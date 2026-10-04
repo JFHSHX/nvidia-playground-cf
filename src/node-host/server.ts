@@ -11,6 +11,7 @@ import { setSolveOverride } from "../hcaptcha/getcaptcha";
 import { solveN as vmSolveN, cryptoMode as vmCryptoMode } from "./hsw-node";
 import { browserSolveN, browserCryptoMode } from "./browser-solver";
 import { initFileLog } from "./logger";
+import { degenerateGuard } from "./degenerate";
 
 initFileLog();
 
@@ -77,33 +78,6 @@ function withCors(res: http.ServerResponse): void {
 
 function errorBody(message: string, type: string, code: string): string {
   return JSON.stringify({ error: { message, type, code } });
-}
-
-/** isDegenerateResponse: true when a non-stream JSON response is a retryable
- * model-variance failure — either (a) an assistant message with null/empty
- * content (a thinking model that spent its whole token budget on reasoning),
- * or (b) reasoning degenerated into a repetition loop (the same character
- * repeated ≥12 times covering ≥50% of the reasoning, e.g. the observed
- * "!!!!…" from kimi-k3 that breaks dsh turns). Reads a CLONE so the original
- * response stays writable. */
-async function isDegenerateResponse(resp: Response): Promise<boolean> {
-  try {
-    const ct = resp.headers.get("content-type") ?? "";
-    if (resp.status !== 200) return false; // 错误响应不是"退化",别浪费重试
-    if (!ct.includes("application/json")) return false; // streaming: never touched
-    const body = await resp.clone().json() as { choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }> };
-    const msg = body?.choices?.[0]?.message;
-    if (!msg) return true;
-    if (msg.content === null || msg.content === "") return true;
-    const rc = msg.reasoning_content ?? "";
-    if (rc.length >= 12) {
-      const m = rc.match(/(.)\1{11,}/);
-      if (m && m[0]!.length >= rc.length * 0.5) return true; // 重复字符占比过半 = 退化
-    }
-    return false;
-  } catch {
-    return false;
-  }
 }
 
 async function readBody(req: http.IncomingMessage): Promise<string> {
@@ -211,12 +185,13 @@ const server = http.createServer(async (req, res) => {
         body,
       });
       let resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
-      // 可重试的模型方差失败:(a) 思考模型(kimi-k3 等)偶发把全部 token 花
-      // 在 reasoning 上,content 返回 null;(b) reasoning 退化为重复字符循环
-      // ("!!!!…" ×N,dsh 实测会触发 harness 的 degenerated 判定并连吃重试)。
-      // 检测到就换新 token 重试,最多 2 次(共 3 次尝试,采样方差通常一两
-      // 次内就有正常回合)。
-      for (let retry = 1; retry <= 2 && (await isDegenerateResponse(resp)); retry++) {
+      // 可重试的模型方差失败:(a) 空 content;(b) reasoning 重复字符退化
+      // ("!!!!…" ×N,dsh 实测触发 harness 的 degenerated 判定)。非流式:
+      // 全量检测;SSE:头部扫描(reasoning delta 在到达客户端前拦截)。
+      // 检出就整条废弃换新 token 重试,最多 2 次(共 3 次尝试)。
+      for (let retry = 1; retry <= 2; retry++) {
+        const guarded = await degenerateGuard(resp);
+        if (guarded) { resp = guarded; break; }
         console.error(`[npg] degenerate response (empty content or repetition-loop reasoning), retry ${retry}/2`);
         resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
       }
