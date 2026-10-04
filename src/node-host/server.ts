@@ -6,7 +6,7 @@ import http from "node:http";
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { handleChatCompletions } from "../gateway/chat";
-import { MODEL_SNAPSHOT } from "../gateway/models-snapshot";
+import { MODEL_SNAPSHOT, DEFAULT_MODEL } from "../gateway/models-snapshot";
 import { setSolveOverride } from "../hcaptcha/getcaptcha";
 import { solveN as vmSolveN, cryptoMode as vmCryptoMode } from "./hsw-node";
 import { browserSolveN, browserCryptoMode } from "./browser-solver";
@@ -60,7 +60,7 @@ async function keepAliveLoop(): Promise<void> {
     console.log(`[npg] keep-alive tick ${new Date().toISOString()}`);
     for (const id of KEEPALIVE_MODELS) {
       try {
-        await throttle(() => handleChatCompletions(keepAliveRequest(id)));
+        await throttleFor(id, () => handleChatCompletions(keepAliveRequest(id)));
         console.log(`[npg] keep-alive ${id} ok`);
       } catch (e) {
         console.error(`[npg] keep-alive ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -133,6 +133,35 @@ function throttle<T>(work: () => Promise<T>): Promise<T> {
   return run;
 }
 
+// --- per-model throttle queues:不同模型 = 不同 NVCF 函数 = 不同共享队列 ---
+// glm-5-3/kimi-k3/nemotron-ultra 各自排各自的队,互相并行(排队时间 ÷ 模型数);
+// 每个模型内部仍是 3s 节奏,不触发 hCaptcha 升级。同一模型的多个请求仍串行
+// (同一函数只有一条 NVIDIA 队列,开并发只会加深队列、放大 502)。
+const chatChains = new Map<string, Promise<unknown>>();
+const lastChatDoneByModel = new Map<string, number>();
+
+function poolKey(model: string): string {
+  // pin 语法 "<fid>@<model>":池子按 base 模型分
+  const at = model.indexOf("@");
+  return at >= 0 ? model.slice(at + 1) : model;
+}
+
+function throttleFor<T>(model: string, work: () => Promise<T>): Promise<T> {
+  const key = poolKey(model);
+  const chain = chatChains.get(key) ?? Promise.resolve();
+  const run = chain.then(async () => {
+    const wait = (lastChatDoneByModel.get(key) ?? 0) + CHAT_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return await work();
+    } finally {
+      lastChatDoneByModel.set(key, Date.now());
+    }
+  });
+  chatChains.set(key, run.then(() => undefined, () => undefined));
+  return run;
+}
+
 const server = http.createServer(async (req, res) => {
   const t0 = Date.now();
   res.on("finish", () => console.log(`req ${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - t0}ms`));
@@ -156,6 +185,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       const body = await readBody(req);
+      // 按请求的模型分队列:不同模型 = 不同 NVCF 共享队列,可互相并行
+      let reqModel = DEFAULT_MODEL;
+      try {
+        const p = JSON.parse(body) as { model?: unknown };
+        if (p && typeof p.model === "string" && p.model !== "") reqModel = p.model;
+      } catch {
+        // bad body:handler 会 400;仍按默认模型节流
+      }
       // 每次尝试用全新的 Request(上一次尝试已消费 request 的 body 流,
       // 复用会得到 "invalid json body");body 字符串本身可重复使用。
       const makeReq = () => new Request("http://localhost/v1/chat/completions", {
@@ -163,13 +200,13 @@ const server = http.createServer(async (req, res) => {
         headers: { "content-type": "application/json" },
         body,
       });
-      let resp = await throttle(() => handleChatCompletions(makeReq()));
+      let resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
       // 思考模型(kimi-k3 等)偶发把全部 token 花在 reasoning 上,content 返回
       // null → harness/客户端拿到空回合。检测到空 content 就换新 token 重试
       // 一次(采样方差通常第二次就有 content)。
       if (await isEmptyAssistantContent(resp)) {
         console.error(`[npg] empty content in response, retrying once with a fresh token`);
-        resp = await throttle(() => handleChatCompletions(makeReq()));
+        resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
       }
       await writeResponse(resp, res);
       return;
