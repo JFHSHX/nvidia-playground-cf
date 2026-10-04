@@ -389,7 +389,35 @@ function streamUpstreamSse(upstream: Response): Response {
 
 async function nonStreamResponse(upstream: Response): Promise<Response> {
   const contentType = upstream.headers.get("Content-Type") ?? "";
-  const text = await upstream.text();
+  // 有些模型(glm-5-3 实测)的非流式响应:完整 JSON 已到,但连接被 SSE 基础
+  // 设施挂着不关 → upstream.text() 永不返回(会一直挂到 300s abort)。
+  // 改成流式读:JSON 一旦可解析就停,并取消上游连接。
+  let text = "";
+  const reader = upstream.body?.getReader() ?? null;
+  if (reader === null) {
+    text = "";
+  } else {
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+        try {
+          const parsed = JSON.parse(text) as unknown;
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) break; // JSON 已完整
+        } catch {
+          // 还没读完整,继续
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // 忽略
+      }
+    }
+  }
 
   let out: Record<string, unknown> | null = null;
   // NVIDIA's predict returns a JSON chat.completion body with a misleading

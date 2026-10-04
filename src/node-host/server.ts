@@ -37,6 +37,38 @@ if ((process.env.NPG_SOLVER ?? "browser") === "vm") {
 }
 const SOLVER_NAME = (process.env.NPG_SOLVER ?? "browser");
 
+// --- keep-alive warmer:保持 NVCF 实例温热 ---
+// 实例缩容后,下一次真实请求会撞上冷启动(可用模型 5-30s)或直接 502
+// "Retries exhausted 3/3"(实例拉不起来,实测 kimi-k3 间歇全 502)。定时用
+// 最小请求(max_tokens:1)打一遍偏好模型,把实例钉在温热状态。
+const KEEPALIVE_MS = Number(process.env.NPG_KEEPALIVE_MS ?? 60_000);
+const KEEPALIVE_MODELS = (process.env.NPG_KEEPALIVE_MODELS ?? "z-ai/glm-5-3").split(",").map((s) => s.trim()).filter(Boolean);
+
+function keepAliveRequest(modelId: string): Request {
+  return new Request("http://localhost/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 1, stream: false }),
+  });
+}
+
+async function keepAliveLoop(): Promise<void> {
+  // 第一轮立即打(server 启动就预热实例),之后按 KEEPALIVE_MS 节奏;首次
+  // ping 可能要等 NVCF 实例冷启动(~2min),之后都是快 ping。
+  for (let first = true; ; first = false) {
+    if (!first) await new Promise((r) => setTimeout(r, KEEPALIVE_MS));
+    console.log(`[npg] keep-alive tick ${new Date().toISOString()}`);
+    for (const id of KEEPALIVE_MODELS) {
+      try {
+        await throttle(() => handleChatCompletions(keepAliveRequest(id)));
+        console.log(`[npg] keep-alive ${id} ok`);
+      } catch (e) {
+        console.error(`[npg] keep-alive ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+}
+
 function withCors(res: http.ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -153,4 +185,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`nvidia-playground-cf (node host) listening on http://localhost:${PORT}`);
+  if (KEEPALIVE_MODELS.length > 0) {
+    console.log(`keep-alive warmer on: ${KEEPALIVE_MODELS.join(", ")} every ${KEEPALIVE_MS}ms`);
+    void keepAliveLoop();
+  }
 });
