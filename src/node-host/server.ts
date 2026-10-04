@@ -61,8 +61,9 @@ async function keepAliveLoop(): Promise<void> {
     console.log(`[npg] keep-alive tick ${new Date().toISOString()}`);
     for (const id of KEEPALIVE_MODELS) {
       try {
-        await throttleFor(id, () => handleChatCompletions(keepAliveRequest(id)));
-        console.log(`[npg] keep-alive ${id} ok`);
+        const r = await throttleFor(id, () => handleChatCompletions(keepAliveRequest(id)));
+        // 错误响应不抛异常;按真实状态报告,别把 502 也记成 ok
+        console.log(`[npg] keep-alive ${id} ${r.status === 200 ? "ok" : `upstream ${r.status}`}`);
       } catch (e) {
         console.error(`[npg] keep-alive ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
