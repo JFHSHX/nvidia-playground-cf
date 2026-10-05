@@ -38,12 +38,33 @@ if ((process.env.NPG_SOLVER ?? "browser") === "vm") {
 }
 const SOLVER_NAME = (process.env.NPG_SOLVER ?? "browser");
 
-// --- keep-alive warmer:保持 NVCF 实例温热 ---
+// --- keep-alive warmer:保持 NVCF 实例温热(队列感知) ---
 // 实例缩容后,下一次真实请求会撞上冷启动(可用模型 5-30s)或直接 502
-// "Retries exhausted 3/3"(实例拉不起来,实测 kimi-k3 间歇全 502)。定时用
-// 最小请求(max_tokens:1)打一遍偏好模型,把实例钉在温热状态。
+// "Retries exhausted 3/3"。但共享实例 ACTIVE 而队列爆满时(queueDepth 数百),
+// predict 进队后 NVIDIA 网关自己的 3 次重试(~80s each)等不到队头就 500
+// "Retries exhausted 3/3"——此时预热 ping 只是给死队列再加一个请求 + 白耗
+// hCaptcha 求解,反而有害。队列浅时 ping 才有保持温热的价值。queues 端点
+// 免认证(实测只需 Origin/Referer)。
 const KEEPALIVE_MS = Number(process.env.NPG_KEEPALIVE_MS ?? 60_000);
 const KEEPALIVE_MODELS = (process.env.NPG_KEEPALIVE_MODELS ?? "z-ai/glm-5-3").split(",").map((s) => s.trim()).filter(Boolean);
+const QUEUE_SKIP_DEPTH = Number(process.env.NPG_KEEPALIVE_MAX_QUEUE ?? 32);
+const QUEUES_ENDPOINT = "https://buildapi.ngc.nvidia.com/v2/predict/queues/models";
+const PREDICT_NAMESPACE = "qc69jvmznzxy";
+
+/** queueDepthFor: 查共享实例当前队列深度;查不到返回 -1(未知 → 照常 ping,保守)。 */
+async function queueDepthFor(slug: string): Promise<number> {
+  try {
+    const r = await fetch(`${QUEUES_ENDPOINT}/${PREDICT_NAMESPACE}/${slug}`, {
+      headers: { Origin: "https://build.nvidia.com", Referer: "https://build.nvidia.com/" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return -1;
+    const j = await r.json() as { queues?: Array<{ queueDepth?: number }> };
+    return j?.queues?.[0]?.queueDepth ?? -1;
+  } catch {
+    return -1;
+  }
+}
 
 function keepAliveRequest(modelId: string): Request {
   return new Request("http://localhost/v1/chat/completions", {
@@ -61,9 +82,16 @@ async function keepAliveLoop(): Promise<void> {
     console.log(`[npg] keep-alive tick ${new Date().toISOString()}`);
     for (const id of KEEPALIVE_MODELS) {
       try {
+        // 队列感知:队列深 = 实例本来就热,预热 ping 只会排队 + 白耗求解 → 跳过
+        const slug = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+        const depth = await queueDepthFor(slug);
+        if (depth > QUEUE_SKIP_DEPTH) {
+          console.log(`[npg] keep-alive ${id} skipped: queueDepth ${depth} > ${QUEUE_SKIP_DEPTH} (instance hot, ping would just queue behind ${depth})`);
+          continue;
+        }
         const r = await throttleFor(id, () => handleChatCompletions(keepAliveRequest(id)));
         // 错误响应不抛异常;按真实状态报告,别把 502 也记成 ok
-        console.log(`[npg] keep-alive ${id} ${r.status === 200 ? "ok" : `upstream ${r.status}`}`);
+        console.log(`[npg] keep-alive ${id} ${r.status === 200 ? "ok" : `upstream ${r.status}`}${depth >= 0 ? ` (queueDepth ${depth})` : ""}`);
       } catch (e) {
         console.error(`[npg] keep-alive ${id} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
