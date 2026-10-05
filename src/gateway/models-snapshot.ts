@@ -9,6 +9,12 @@ export function predictEndpoint(info: ModelInfo): string {
   return `${PREDICT_BASE}/v2/predict/models/${info.namespace}/${info.slug}`;
 }
 
+/** predict/queues 查询端点:免认证(实测只需 Origin/Referer),返回
+ * functionStatus + queueDepth——用来区分"实例挂了"和"公共队列拥堵"。 */
+export function queuesEndpoint(info: ModelInfo): string {
+  return `${PREDICT_BASE}/v2/predict/queues/models/${info.namespace}/${info.slug}`;
+}
+
 export interface ModelInfo {
   /** predict URL 路径段(模型 id 最后一个 "/") */
   slug: string;

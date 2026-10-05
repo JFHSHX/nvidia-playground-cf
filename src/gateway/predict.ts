@@ -1,7 +1,7 @@
 // src/gateway/predict.ts — predict 请求组装、nv-function-id/slug 校验、错误映射、重试
 // 协议细节全按 reference/upstream-protocol.md(executor.go / function_ref.go / types.go)。
 
-import { DEFAULT_NAMESPACE as DEFAULT_NS, MODEL_SNAPSHOT, predictEndpoint, type ModelInfo } from "./models-snapshot";
+import { DEFAULT_NAMESPACE as DEFAULT_NS, MODEL_SNAPSHOT, predictEndpoint, queuesEndpoint, type ModelInfo } from "./models-snapshot";
 
 // --- 模型查找(快照 + live registry 覆盖层) ---
 
@@ -242,6 +242,25 @@ export function buildPredictHeaders(info: ModelInfo, token: string): PredictHead
   };
 }
 
+/** queueDepthHint: "Retries exhausted" 时查一次队列深度(免认证端点),把
+ * 根因写进 502 错误消息,让调用方一眼看出是公共拥堵还是实例问题。
+ * 查不到返回空串。 */
+async function queueDepthHint(info: ModelInfo): Promise<string> {
+  try {
+    const r = await fetch(queuesEndpoint(info), {
+      headers: { Origin: "https://build.nvidia.com", Referer: "https://build.nvidia.com/" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return "";
+    const j = await r.json() as { queues?: Array<{ queueDepth?: number; functionStatus?: string }> };
+    const q = j?.queues?.[0];
+    if (!q || typeof q.queueDepth !== "number") return "";
+    return ` (instance ${q.functionStatus ?? "unknown"}, queueDepth ${q.queueDepth}: shared-instance congestion — NVIDIA's own 3 internal retries cannot reach the queue head; retry later or use another model)`;
+  } catch {
+    return "";
+  }
+}
+
 /**
  * 执行 predict:POST 端点,重试可重试 captcha 失败(换新 token)。返回 status < 400 的
  * 上游 Response;失败抛 GatewayError(400/401/408/502/503)。
@@ -302,6 +321,14 @@ export async function doPredict(
     // "close failure has no effect" 语义在这里不适用。
     const raw = await resp.text();
     lastUpstreamMessage = raw;
+
+    if (raw.includes("Retries exhausted")) {
+      // NVIDIA 网关自己的 3 次内部重试(~80s each)已放弃:共享队列拥堵
+      // (实测 glm-5-3 queueDepth 900-1150)或实例不可达。我们的再试只会
+      // 再排一次队,直接查一次队列深度(免认证)把根因带回给调用方。
+      const hint = await queueDepthHint(info);
+      throw new GatewayError(502, "upstream_queue_overloaded", `upstream: ${upstreamErrorMessage(raw)}${hint}`);
+    }
 
     if (isRetryableCaptchaFailure(resp.status, raw) && attempt < maxAttempts) {
       continue; // 换新 token 重试
