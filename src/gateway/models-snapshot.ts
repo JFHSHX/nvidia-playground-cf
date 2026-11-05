@@ -1,5 +1,8 @@
-// src/gateway/models-snapshot.ts — 静态模型快照(live 探测刷新,2026-10-03)
-// 17 个带内联 nvcfFunctionId 的 playground 模型;live 抓取失败时回退本快照。
+// src/gateway/models-snapshot.ts — 静态模型快照(live 探测刷新,2026-10-03;
+// 2026-11-05 目录核对:23 个。glm-5-3/kimi-k3/nemotron-3-super-120b/llama-3.2-11b
+// 已从目录页下架但 functionId/spec 仍活,保留待真正下线(实测时好时坏)。
+// 注意(2026-10-17 实测):kimi-k3 与 ising-calibration-1-35b-a3b 已被上游下架
+// (queues 端点 404、spec 无 functionVersionId),请求会得到 502 upstream 404。
 
 export const PREDICT_BASE = "https://buildapi.ngc.nvidia.com";
 export const DEFAULT_NAMESPACE = "qc69jvmznzxy";
@@ -59,10 +62,28 @@ export const MODEL_SNAPSHOT: Record<string, ModelInfo> = {
     namespace: "qc69jvmznzxy",
     functionId: "fd21cc19-b4ff-4949-ba07-90dd663c416a",
   },
+  "minimaxai/minimax-m3.1-flash": {
+    slug: "minimax-m3.1-flash",
+    namespace: "qc69jvmznzxy",
+    functionId: "eb8265c4-e47d-4047-918d-c12746cc2cee",
+  },
+  "mistralai/mistral-large-4-1t-a52b": {
+    slug: "mistral-large-4-1t-a52b",
+    namespace: "qc69jvmznzxy",
+    functionId: "f238fb4a-8a45-473f-a81f-b7d30f56e2b0",
+  },
   "moonshotai/kimi-k3": {
     slug: "kimi-k3",
     namespace: "qc69jvmznzxy",
     functionId: "1586112a-925c-48af-8631-7c815dbd749c",
+  },
+  "moonshotai/kimi-k3_1-pro": {
+    slug: "kimi-k3_1-pro",
+    namespace: "qc69jvmznzxy",
+    functionId: "b79234a1-64e1-479e-87e7-1c8e3af74262",
+    // 实测(2026-11-05):body 规范名带点;最小 body 200,DSH 风格参数(疑 top_p/
+    // stop 等)400——与 kimi-k3 同族的严格校验,接入时注意
+    model: "moonshotai/kimi-k3.1-pro",
   },
   "nvidia/ising-calibration-1-35b-a3b": {
     slug: "ising-calibration-1-35b-a3b",
@@ -94,6 +115,16 @@ export const MODEL_SNAPSHOT: Record<string, ModelInfo> = {
     namespace: "qc69jvmznzxy",
     functionId: "0a213807-640b-43fb-bfbf-2919f9b666ad",
   },
+  "nvidia/nemotron-3.5-bolt-e4b": {
+    slug: "nemotron-3.5-bolt-e4b",
+    namespace: "qc69jvmznzxy",
+    functionId: "9fd8dea3-511e-4771-bafb-e6f207d11cc8",
+  },
+  "nvidia/nemotron-3.5-super-vl-120b-a12b": {
+    slug: "nemotron-3.5-super-vl-120b-a12b",
+    namespace: "qc69jvmznzxy",
+    functionId: "b300b2c8-f52e-40c2-aa0c-6a55fd5e50e1",
+  },
   "openai/gpt-oss-20b": {
     slug: "gpt-oss-20b",
     namespace: "qc69jvmznzxy",
@@ -103,6 +134,11 @@ export const MODEL_SNAPSHOT: Record<string, ModelInfo> = {
     slug: "laguna-xs-2.1",
     namespace: "qc69jvmznzxy",
     functionId: "4a8f921c-c99d-4cde-92c1-c92ba9e4c50f",
+  },
+  "stepfun-ai/step-5-preview": {
+    slug: "step-5-preview",
+    namespace: "qc69jvmznzxy",
+    functionId: "d64c848d-0a4b-400a-b780-75d603c6bc3a",
   },
   "z-ai/glm-5-3": {
     slug: "glm-5-3",

@@ -24,6 +24,14 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[npg] unhandledRejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`);
 });
 process.on("uncaughtException", (err) => {
+  // undici fetch 中止竞态:h2 流错误/客户端中止触发 Fetch.onAborted 双路径逃逸
+  // (TypeError: terminated,栈全在 undici 内部)——in-flight 请求已死、进程无恙,
+  // 降级为普通日志避免误读成进程级故障;其余错误保持 uncaughtException 标签。
+  const undiciAbortRace = err instanceof TypeError && err.message === "terminated" && (err.stack ?? "").includes("undici");
+  if (undiciAbortRace) {
+    console.error(`[npg] upstream stream terminated (undici abort race — in-flight request lost, process unaffected)`);
+    return;
+  }
   console.error(`[npg] uncaughtException: ${err.stack ?? err.message}`);
 });
 
@@ -46,7 +54,7 @@ const SOLVER_NAME = (process.env.NPG_SOLVER ?? "browser");
 // hCaptcha 求解,反而有害。队列浅时 ping 才有保持温热的价值。queues 端点
 // 免认证(实测只需 Origin/Referer)。
 const KEEPALIVE_MS = Number(process.env.NPG_KEEPALIVE_MS ?? 60_000);
-const KEEPALIVE_MODELS = (process.env.NPG_KEEPALIVE_MODELS ?? "z-ai/glm-5-3").split(",").map((s) => s.trim()).filter(Boolean);
+const KEEPALIVE_MODELS = (process.env.NPG_KEEPALIVE_MODELS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 const QUEUE_SKIP_DEPTH = Number(process.env.NPG_KEEPALIVE_MAX_QUEUE ?? 32);
 const QUEUES_ENDPOINT = "https://buildapi.ngc.nvidia.com/v2/predict/queues/models";
 const PREDICT_NAMESPACE = "qc69jvmznzxy";
@@ -121,7 +129,18 @@ async function writeResponse(resp: Response, res: http.ServerResponse): Promise<
   res.writeHead(resp.status, headers);
   if (!resp.body) { res.end(); return; }
   // Stream the body (SSE passthrough stays chunk-by-chunk).
-  Readable.fromWeb(resp.body as unknown as NodeWebReadableStream).pipe(res);
+  const body = Readable.fromWeb(resp.body as unknown as NodeWebReadableStream);
+  // 上游 h2 流中止/客户端中途断开:body 流错误必须有人接——否则 undici 的
+  // "terminated" 中止竞态逃逸成 uncaughtException。body 错误 → 干净收尾客户端
+  // 响应;客户端先断 → 主动破坏上游流(不再白耗上游算力)。
+  body.on("error", (err) => {
+    console.error(`[npg] upstream body terminated mid-stream: ${err instanceof Error ? err.message : String(err)}`);
+    if (!res.writableEnded) res.destroy();
+  });
+  res.on("close", () => {
+    if (!res.writableEnded) body.destroy();
+  });
+  body.pipe(res);
 }
 
 // Global chat throttle: serialize chat requests and pace them with a minimum
@@ -177,7 +196,8 @@ function throttleFor<T>(model: string, work: () => Promise<T>): Promise<T> {
 
 const server = http.createServer(async (req, res) => {
   const t0 = Date.now();
-  res.on("finish", () => console.log(`req ${req.method} ${req.url} -> ${res.statusCode} ${Date.now() - t0}ms`));
+  let laneModel = ""; // 请求的模型(body "model"),finish 日志带上以便关联 401/502
+  res.on("finish", () => console.log(`req ${req.method} ${req.url}${laneModel ? ` [${laneModel}]` : ""} -> ${res.statusCode} ${Date.now() - t0}ms`));
   const url = new URL(req.url ?? "/", "http://localhost");
   withCors(res);
   try {
@@ -206,6 +226,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         // bad body:handler 会 400;仍按默认模型节流
       }
+      laneModel = reqModel;
       // 每次尝试用全新的 Request(上一次尝试已消费 request 的 body 流,
       // 复用会得到 "invalid json body");body 字符串本身可重复使用。
       const makeReq = () => new Request("http://localhost/v1/chat/completions", {
@@ -221,7 +242,7 @@ const server = http.createServer(async (req, res) => {
       for (let retry = 1; retry <= 2; retry++) {
         const guarded = await degenerateGuard(resp);
         if (guarded) { resp = guarded; break; }
-        console.error(`[npg] degenerate response (empty content or repetition-loop reasoning), retry ${retry}/2`);
+        console.error(`[npg] degenerate response (empty content or repetition-loop reasoning), retry ${retry}/2 [${reqModel}]`);
         resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
       }
       await writeResponse(resp, res);

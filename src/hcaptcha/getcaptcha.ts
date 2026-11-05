@@ -15,7 +15,7 @@
 // the doc comments and test assertions; CaptchaTokenDetail is not ported.
 // All solver/network phases are async (TS), unlike the Go sync http client.
 import { parsePow } from "./pow";
-import { buildFingerprint } from "./fingerprint";
+import { buildFingerprint, laneVariant } from "./fingerprint";
 import { solveN as solveNWorkerd, cryptoMode as cryptoModeWorkerd, locationFromJWT, HSW_UA } from "./runner";
 import { msgpackDecode, msgpackEncodeMapString, msgpackEncodeWire } from "./msgpack";
 
@@ -34,6 +34,34 @@ export function setSolveOverride(o: NonNullable<typeof solveOverride>): void {
 
 function solveN(location: string, jwt: string, fpB64: string): Promise<string> {
   return solveOverride ? solveOverride.solveN(location, jwt, fpB64) : solveNWorkerd(location, jwt, fpB64);
+}
+
+// --- fail-fast negative cache for poisoned hsw bundle variants ---
+// (getcaptcha.go:7499f30 markBundleBroken): hCaptcha assigns a different
+// hsw.js bundle location per exit-IP reputation; some variants are
+// deliberately broken (compile-poison). When a solve fails with a
+// recognizable "bundle broken" error, the location lands in a 10-minute
+// negative cache so subsequent claims of the same variant skip the
+// eval+10s-solve cost and fail fast.
+const BROKEN_BUNDLES = new Map<string, number>(); // location → expiry timestamp
+
+function markBundleBroken(location: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Compile-poison variants: wasm deliberately fails to compile in any engine.
+  // Classify via error message patterns and cache for 10 minutes.
+  if (msg.includes("unreachable") || msg.includes("compile") || msg.includes("instantiate") || msg.includes("wasm")) {
+    BROKEN_BUNDLES.set(location, Date.now() + 10 * 60 * 1000);
+  }
+}
+
+function isBundleBroken(location: string): boolean {
+  const until = BROKEN_BUNDLES.get(location);
+  if (until === undefined) return false;
+  if (Date.now() > until) {
+    BROKEN_BUNDLES.delete(location);
+    return false;
+  }
+  return true;
 }
 
 function cryptoMode(location: string, mode: number, data: Uint8Array): Promise<Uint8Array> {
@@ -132,8 +160,9 @@ export function findP1Token(body: Uint8Array | null): string {
 /** specFromClaim extracts the challenge spec from a getcaptcha (or
  * checksiteconfig) claim response and returns it as the JSON string the
  * submission's c parameter must carry, plus the challenge jwt inside it
- * (getcaptcha.go:575-593). */
-export function specFromClaim(body: Uint8Array | null): [spec: string, jwt: string] {
+ * (getcaptcha.go:575-593). Also returns the challenge type ("" when absent)
+ * so callers can classify non-PoW challenge kinds. */
+export function specFromClaim(body: Uint8Array | null): [spec: string, jwt: string, ctype: string] {
   let doc: { c?: { type?: string; req?: string } | null };
   try {
     doc = JSON.parse(new TextDecoder().decode(body ?? new Uint8Array(0))) as typeof doc;
@@ -143,7 +172,24 @@ export function specFromClaim(body: Uint8Array | null): [spec: string, jwt: stri
   if (!doc.c || !doc.c.req) {
     throw new Error(`no challenge in claim: ${clipBytes(body)}`);
   }
-  return [JSON.stringify(doc.c), doc.c.req];
+  return [JSON.stringify(doc.c), doc.c.req, doc.c.type ?? ""];
+}
+
+/** reissuedChallenge reports whether body carries a fresh challenge instead
+ * of a passcode — the server's answer to a rejected proof. Yields the new
+ * challenge spec (the JSON the next submission's c parameter carries), the
+ * new challenge jwt and its type. ok is false for passcode payloads,
+ * encrypted bodies and anything else that is not a {"c":{...,"req":...}} doc.
+ * (getcaptcha.go:7499f30 reissuedChallenge) */
+function reissuedChallenge(body: Uint8Array | null): [spec: string, jwt: string, ctype: string, ok: boolean] {
+  let doc: { c?: { type?: string; req?: string } | null };
+  try {
+    doc = JSON.parse(new TextDecoder().decode(body ?? new Uint8Array(0))) as typeof doc;
+  } catch {
+    return ["", "", "", false];
+  }
+  if (!doc.c || !doc.c.req) return ["", "", "", false];
+  return [JSON.stringify(doc.c), doc.c.req, doc.c.type ?? "", true];
 }
 
 /** mustJSONString quotes s as a JSON string value (getcaptcha.go:609-615). */
@@ -336,7 +382,7 @@ export async function fetchChecksite(sitekey: string, host: string): Promise<[jw
  *   encrypted submission.
  * Throws (stage-prefixed) on the fatal stages; variant failures are
  * recorded in the attempts. */
-export async function captchaAttempts(sitekey: string, host: string): Promise<[solve: SolveInfo, attempts: CaptchaAttempt[]]> {
+export async function captchaAttempts(sitekey: string, host: string, lane?: string): Promise<[solve: SolveInfo, attempts: CaptchaAttempt[]]> {
   const start = Date.now();
 
   // Speculative phase-A claim, concurrent with checksiteconfig
@@ -363,7 +409,7 @@ export async function captchaAttempts(sitekey: string, host: string): Promise<[s
     // A spiked challenge is abandoned and a fresh one claimed, up to 3 rounds;
     // most challenges carry a small difficulty (s=4 → 8 bits → trivial).
     for (let round = 0; round < 3; round++) {
-      const [at, inf] = await runEncryptedAttempt(sitekey, host, pclaim);
+      const [at, inf] = await runEncryptedAttempt(sitekey, host, pclaim, lane);
       attempts.push(at);
       info = inf;
       if (at.token !== "") break;
@@ -385,7 +431,7 @@ export async function captchaAttempts(sitekey: string, host: string): Promise<[s
   }
   let fpB64: string;
   try {
-    fpB64 = buildFingerprint(pow);
+    fpB64 = buildFingerprint(pow, laneVariant(lane));
   } catch (e) {
     throw new Error(`hcaptcha: getcaptcha: build fingerprint: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -393,6 +439,7 @@ export async function captchaAttempts(sitekey: string, host: string): Promise<[s
   try {
     n = await solveN(location, jwt, fpB64);
   } catch (e) {
+    markBundleBroken(location, e);
     throw new Error(`hcaptcha: getcaptcha: solve: ${e instanceof Error ? e.message : String(e)}`);
   }
   const solve: SolveInfo = { jwt, location, key, fingerprint: fpB64, n, elapsedMs: Date.now() - start };
@@ -416,7 +463,7 @@ export async function captchaAttempts(sitekey: string, host: string): Promise<[s
   }
 
   // Encrypted fallback on a fresh claim (getcaptcha.go:434-436).
-  const [at] = await runEncryptedAttempt(sitekey, host, null);
+  const [at] = await runEncryptedAttempt(sitekey, host, null, lane);
   attempts.push(at);
   return [solve, attempts];
 }
@@ -425,8 +472,19 @@ export async function captchaAttempts(sitekey: string, host: string): Promise<[s
  * submission: phase-A claim (given, or fresh when null), solve the claimed
  * jwt, encrypt the params and submit the [spec, ext18(cipher)] wire
  * (getcaptcha.go:449-557). Never throws — failures are carried on the
- * attempt. */
-async function runEncryptedAttempt(sitekey: string, host: string, claim: GcHttpResult | null): Promise<[at: CaptchaAttempt, info: SolveInfo]> {
+ * attempt.
+ *
+ * The submission is a bounded loop, not a single shot (getcaptcha.go:7499f30):
+ * hCaptcha rotates hsw bundle variants by exit-IP reputation, and a submission
+ * the server will not accept is answered with a fresh challenge — a plaintext
+ * (or decrypted) {"c":{"type":"hsw","req":<new jwt>}} — instead of a passcode.
+ * The widget flow solves the new challenge and submits again; this loop
+ * follows it, up to MAX_ENCRYPTED_ROUNDS rounds, re-deriving the solver from
+ * each new challenge's own bundle location. Challenges of any other type
+ * are not solvable headless and fail with a classified error. */
+const MAX_ENCRYPTED_ROUNDS = 3;
+
+async function runEncryptedAttempt(sitekey: string, host: string, claim: GcHttpResult | null, lane?: string): Promise<[at: CaptchaAttempt, info: SolveInfo]> {
   const params = { v: GETCAPTCHA_VERSION, sitekey, host, hl: "en" };
   const info: SolveInfo = { jwt: "", location: "", key: "", fingerprint: "", n: "", elapsedMs: 0 };
   const t0 = Date.now();
@@ -460,122 +518,205 @@ async function runEncryptedAttempt(sitekey: string, host: string, claim: GcHttpR
   at.status = status;
   at.body = claimBody;
 
-  let spec: string, jwt: string;
+  let spec: string, jwt: string, ctype: string;
   try {
-    [spec, jwt] = specFromClaim(claimBody);
+    [spec, jwt, ctype] = specFromClaim(claimBody);
   } catch (e) {
     at.err = `hcaptcha: getcaptcha: claim: ${e instanceof Error ? e.message : String(e)}`;
     at.elapsedMs = Date.now() - t0;
     return [at, info];
   }
+  if (ctype !== "" && ctype !== "hsw") {
+    at.err = `hcaptcha: getcaptcha: server issued "${ctype}" challenge (only hsw is solvable headless)`;
+    at.elapsedMs = Date.now() - t0;
+    return [at, info];
+  }
   info.jwt = jwt;
 
-  // Solve the claimed challenge; the solver is keyed by the claimed JWT's own
-  // bundle location (getcaptcha.go:480-506).
-  let location: string;
-  try {
-    location = locationFromJWT(jwt);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: claim location: ${e instanceof Error ? e.message : String(e)}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  info.location = location;
+  // The submission is a bounded loop, not a single shot. hCaptcha rotates hsw
+  // bundle variants by exit-IP reputation (a datacenter exit is assigned a
+  // different location on nearly every claim), and a submission the server
+  // will not accept is answered with a fresh challenge — a plaintext (or
+  // decrypted) {"c":{"type":"hsw","req":<new jwt>}} — instead of a passcode.
+  // The widget flow solves the new challenge and submits again; this loop
+  // follows it, up to MAX_ENCRYPTED_ROUNDS rounds, re-deriving the solver from
+  // each new challenge's own bundle location. (getcaptcha.go:7499f30)
+  const MAX_ENCRYPTED_ROUNDS = 3;
+  for (let round = 1; round <= 3; round++) {
+    if (round > 1) at.name = `encrypted-r${round}`;
 
-  let pow;
-  try {
-    pow = parsePow(jwt);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: parse claimed pow: ${e instanceof Error ? e.message : String(e)}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  let fpB64: string;
-  try {
-    fpB64 = buildFingerprint(pow);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: build claimed fingerprint: ${e instanceof Error ? e.message : String(e)}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  info.fingerprint = fpB64;
-  let n: string;
-  try {
-    n = await solveN(location, jwt, fpB64);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: solve claimed challenge: ${e instanceof Error ? e.message : String(e)}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  info.n = n;
+    // Solve the current challenge; the solver is keyed by the challenge JWT's
+    // own bundle location: the proof of work is bundle-variant-bound (solving
+    // with a different variant's wasm yields an n the server rejects with
+    // another challenge).
+    let location: string;
+    try {
+      location = locationFromJWT(jwt);
+    } catch (e) {
+      at.err = `hcaptcha: getcaptcha: claim location: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    info.location = location;
 
-  // Encrypt the params and submit the msgpack [c-spec, ext18(cipher)] wire as
-  // application/octet-stream (getcaptcha.go:509-529).
-  const sub = gcParams(params, { n });
-  at.params = sub;
-  let plain: Uint8Array, cipher: Uint8Array;
-  try {
-    plain = msgpackEncodeMapString(sub);
-    cipher = await cryptoMode(location, 1, plain);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: encrypt: ${e instanceof Error ? e.message : String(e)}`;
+    // Fail-fast: if this bundle variant is known-broken (compile-poison),
+    // skip the solve entirely instead of paying eval+10s-solve.
+    if (isBundleBroken(location)) {
+      at.err = `hcaptcha: getcaptcha: bundle variant ${location} is known-broken (cached 10min)`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+
+    let pow;
+    try {
+      pow = parsePow(jwt);
+    } catch (e) {
+      at.err = `hcaptcha: getcaptcha: parse claimed pow: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    let fpB64: string;
+    try {
+      fpB64 = buildFingerprint(pow, laneVariant(lane));
+    } catch (e) {
+      at.err = `hcaptcha: getcaptcha: build claimed fingerprint: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    info.fingerprint = fpB64;
+    let n: string;
+    try {
+      n = await solveN(location, jwt, fpB64);
+    } catch (e) {
+      markBundleBroken(location, e);
+      at.err = `hcaptcha: getcaptcha: solve claimed challenge: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    info.n = n;
+
+    // Encrypt the params and submit the msgpack [c-spec, ext18(cipher)] wire as
+    // application/octet-stream (getcaptcha.go:509-529).
+    const sub = gcParams(params, { n });
+    at.params = sub;
+    let plain: Uint8Array, cipher: Uint8Array;
+    try {
+      plain = msgpackEncodeMapString(sub);
+      cipher = await cryptoMode(location, 1, plain);
+    } catch (e) {
+      at.err = `hcaptcha: getcaptcha: encrypt: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    const wire = msgpackEncodeWire(spec, cipher);
+    const res = await postGetCaptchaBody(sitekey, wire, "application/octet-stream", "octet-stream");
+    at.status = res.status;
+    at.body = res.body;
+    if (res.err !== "") {
+      at.err = `hcaptcha: getcaptcha: ${res.err}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+
+    // Case 1: a plain-text passcode (some backend generations answer
+    // unencrypted even on the octet wire).
+    at.token = findP1Token(res.body);
+    if (at.token !== "") {
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+
+    // Case 2: the proof was rejected — the server answers with a fresh
+    // challenge that the widget flow solves and resubmits. Follow it.
+    const [spec2, jwt2, ctype2, ok2] = reissuedChallenge(res.body);
+    if (ok2) {
+      if (ctype2 !== "" && ctype2 !== "hsw") {
+        at.err = `hcaptcha: getcaptcha: server re-issued "${ctype2}" challenge (not solvable via PoW)`;
+        at.elapsedMs = Date.now() - t0;
+        return [at, info];
+      }
+      spec = spec2;
+      jwt = jwt2;
+      if (round < MAX_ENCRYPTED_ROUNDS) {
+        at.name = `encrypted-r${round + 1}`;
+        continue;
+      }
+      at.err = `hcaptcha: getcaptcha: server re-issued a fresh challenge ${MAX_ENCRYPTED_ROUNDS} times (proof kept being rejected)`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    if (res.status !== 200) {
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+
+    // Case 3: a 200 answer to an encrypted submission is the wasm-encrypted
+    // response; decrypt (mode 0) and msgpack-decode before scanning for a
+    // passcode. The decrypted answer may itself be a re-issued challenge.
+    let dec: Uint8Array;
+    try {
+      dec = await cryptoMode(location, 0, res.body!);
+    } catch (e) {
+      at.err = `hcaptcha: getcaptcha: decrypt: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    let msg: unknown, rest: Uint8Array;
+    try {
+      [msg, rest] = msgpackDecode(dec);
+    } catch (e) {
+      at.err = `hcaptcha: getcaptcha: decode response: ${e instanceof Error ? e.message : String(e)}`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    if (rest.length > 0) {
+      at.err = `hcaptcha: getcaptcha: decode response: ${rest.length} trailing bytes`;
+      at.elapsedMs = Date.now() - t0;
+      return [at, info];
+    }
+    const j = JSON.stringify(msg);
+    // The decrypted answer may itself be a re-issued challenge.
+    const [spec3, jwt3, ctype3, ok3] = reissuedChallenge(encodeUtf8(j));
+    if (ok3) {
+      if (ctype3 !== "" && ctype3 !== "hsw") {
+        at.err = `hcaptcha: getcaptcha: server re-issued "${ctype3}" challenge (not solvable via PoW)`;
+        at.elapsedMs = Date.now() - t0;
+        return [at, info];
+      }
+      spec = spec3;
+      jwt = jwt3;
+      continue;
+    }
+    at.token = findP1Token(encodeUtf8(j));
+    if (at.token === "") {
+      at.err = `hcaptcha: getcaptcha: encrypted response carries no passcode: ${clipBytes(encodeUtf8(j))}`;
+    }
     at.elapsedMs = Date.now() - t0;
     return [at, info];
   }
-  const wire = msgpackEncodeWire(spec, cipher);
-  const res = await postGetCaptchaBody(sitekey, wire, "application/octet-stream", "octet-stream");
-  at.status = res.status;
-  at.body = res.body;
-  if (res.err !== "") {
-    at.err = `hcaptcha: getcaptcha: ${res.err}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  at.token = findP1Token(res.body);
-  if (at.token !== "" || res.status !== 200) {
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  // A 200 answer to an encrypted submission is the wasm-encrypted response;
-  // decrypt (mode 0) and msgpack-decode before scanning for a passcode
-  // (getcaptcha.go:531-556).
-  let dec: Uint8Array;
-  try {
-    dec = await cryptoMode(location, 0, res.body!);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: decrypt: ${e instanceof Error ? e.message : String(e)}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  let msg: unknown, rest: Uint8Array;
-  try {
-    [msg, rest] = msgpackDecode(dec);
-  } catch (e) {
-    at.err = `hcaptcha: getcaptcha: decode response: ${e instanceof Error ? e.message : String(e)}`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  if (rest.length > 0) {
-    at.err = `hcaptcha: getcaptcha: decode response: ${rest.length} trailing bytes`;
-    at.elapsedMs = Date.now() - t0;
-    return [at, info];
-  }
-  const j = JSON.stringify(msg);
-  at.token = findP1Token(encodeUtf8(j));
-  if (at.token === "") {
-    at.err = `hcaptcha: getcaptcha: encrypted response carries no passcode: ${clipBytes(encodeUtf8(j))}`;
-  }
+  at.err = `hcaptcha: getcaptcha: server re-issued a fresh challenge 3 times (proof kept being rejected)`;
   at.elapsedMs = Date.now() - t0;
   return [at, info];
 }
 
 /** CaptchaToken solves the challenge and returns the first P1_ passcode
  * (RECONSTRUCTED from captcha-pow.go's PowExtract contract: each call
- * performs a full solve and returns a fresh one-shot token). */
-export async function captchaToken(sitekey: string, host: string): Promise<string> {
-  const [, attempts] = await captchaAttempts(sitekey, host);
+ * performs a full solve and returns a fresh one-shot token). Logs one
+ * summary line per solve with the lane (model slug) and fingerprint variant
+ * (fp vN, omitted for the default v0) — the experiment's observability:
+ * previously successful solves were invisible in the log. */
+export async function captchaToken(sitekey: string, host: string, lane?: string): Promise<string> {
+  const t0 = Date.now();
+  const variant = laneVariant(lane);
+  const tags = `${lane && lane !== "" ? ` lane=${lane}` : ""}${variant > 0 ? ` fp=v${variant}` : ""}`;
+  const [, attempts] = await captchaAttempts(sitekey, host, lane);
+  const elapsed = Date.now() - t0;
   for (const at of attempts) {
-    if (at.token !== "") return at.token;
+    if (at.token !== "") {
+      console.log(`[npg] captcha${tags} ok ${elapsed}ms (${attempts.length} attempt${attempts.length === 1 ? "" : "s"})`);
+      return at.token;
+    }
   }
-  throw new Error(`hcaptcha: no passcode in ${attempts.length} attempts: ${attempts.map((a) => `${a.name}[status=${a.status}]: ${a.err || "no token in body"}`).join("; ")}`);
+  console.error(`[npg] captcha${tags} no-pass ${elapsed}ms (${attempts.length} attempts)`);
+  throw new Error(`hcaptcha: no passcode in ${attempts.length} attempts${tags ? ` [${tags.trim()}]` : ""}: ${attempts.map((a) => `${a.name}[status=${a.status}]: ${a.err || "no token in body"}`).join("; ")}`);
 }

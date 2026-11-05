@@ -217,7 +217,7 @@ export function upstreamErrorMessage(raw: string): string {
 
 // --- predict 执行(executor.go doPredict;client 供 token 时 maxAttempts=1,池供 token 时 3) ---
 
-export type AcquireCaptcha = () => Promise<{ captchaToken: string }>;
+export type AcquireCaptcha = (lane?: string) => Promise<{ captchaToken: string }>;
 
 const PREDICT_ATTEMPTS_WITH_POOL = 3;
 
@@ -282,7 +282,7 @@ export async function doPredict(
     if (token === "") {
       let acquired: { captchaToken: string };
       try {
-        acquired = await acquireCaptcha();
+        acquired = await acquireCaptcha(info.slug);
       } catch (err) {
         // 求解失败:池空 → 503;取消 → 408;其余 → 401
         const msg = err instanceof Error ? err.message : String(err);
@@ -321,6 +321,16 @@ export async function doPredict(
     // "close failure has no effect" 语义在这里不适用。
     const raw = await resp.text();
     lastUpstreamMessage = raw;
+
+    // NPG_DEBUG_BODY=1:上游 4xx/5xx 时把发上去的请求体(截断)记进日志——实测
+    // glm-5-3-flash / nemotron-ultra 的 400 上游 cause 会被截断在 URL 中间,
+    // 看不到被拒的确切字段。默认关闭,只在需要定位时开。
+    if (process.env.NPG_DEBUG_BODY === "1") {
+      const cap = 4 * 1024;
+      console.error(
+        `[npg-gw] upstream ${resp.status} on ${endpoint}; request body: ${body.length > cap ? `${body.slice(0, cap)}…(+${body.length - cap}B truncated)` : body}`,
+      );
+    }
 
     if (raw.includes("Retries exhausted")) {
       // NVIDIA 网关自己的 3 次内部重试(~80s each)已放弃:共享队列拥堵

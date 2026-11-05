@@ -28,12 +28,14 @@ export interface NvCaptcha {
 /** Token TTL used for expireAtMs (Go pool.go default 90s). */
 export const CAPTCHA_TTL_MS = 90_000;
 
-/** acquireNvCaptcha: full solve returning a fresh one-shot token. Throws
+/** acquireNvCaptcha: full solve returning a fresh one-shot token. lane (the
+ * model slug) binds the solve to a stable fingerprint identity from the pool
+ * (NPG_FINGERPRINT_COUNT, default 1 = historical single identity). Throws
  * Error on failure — including PowBudgetExceeded when the hashcash stamp
  * search exceeds its wall-clock budget (src/hcaptcha/pow.ts). Safe for
  * concurrent use; each caller gets an independent solve. */
-export async function acquireNvCaptcha(): Promise<NvCaptcha> {
-  const token = await captchaToken(PLAYGROUND_SITEKEY, PLAYGROUND_HOST);
+export async function acquireNvCaptcha(lane?: string): Promise<NvCaptcha> {
+  const token = await captchaToken(PLAYGROUND_SITEKEY, PLAYGROUND_HOST, lane);
   return { captchaToken: token, functionId: "", expireAtMs: Date.now() + CAPTCHA_TTL_MS };
 }
 

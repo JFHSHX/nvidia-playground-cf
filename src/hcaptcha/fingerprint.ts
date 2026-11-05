@@ -5,19 +5,34 @@
 // a real hashcash stamp (mintStamp at s*2 bits) and a self-consistent CRC-32
 // rand element. Returns the fingerprint standard-base64 encoded, the form the
 // hsw.js bundle consumes.
-import { hashString, mintStamp, randHash, type Pow } from "./pow";
+import { hashString, mintStamp, randHash, PowBudgetExceeded, type Pow } from "./pow";
 
 /** Where hCaptcha serves challenge assets and hsw.js bundles; the fingerprint
  * proof_spec._location is built from it plus the JWT "l" claim. */
 export const ASSET_BASE = "https://newassets.hcaptcha.com";
 
-/** Static raw content that hash-class component fields stand in for (phase 1
- * ships no browser collection; values are deterministic placeholders). */
-const HASH_RAW_BY_FIELD: Record<string, string> = {
-  canvas_hash: "hcaptcha-phase1-canvas-placeholder",
-  parent_win_hash: "hcaptcha-phase1-parent-window-placeholder",
-  performance_hash: "hcaptcha-phase1-performance-placeholder",
-};
+/** FpVariantSpec swaps ONLY safe identity fields — the xxh3-hashed raw
+ * strings and the screen block — never the UA/common_keys set (which must
+ * stay self-consistent with the Chrome/123 fingerprint family): each variant
+ * reads as a different device while every field stays coherent. */
+interface FpVariantSpec {
+  label: string;
+  canvasHashRaw: string;
+  parentWinHashRaw: string;
+  performanceHashRaw: string;
+  screenWidth: number;
+  screenHeight: number;
+  screenAvailWidth: number;
+  screenAvailHeight: number;
+}
+
+/** Variant 0 mirrors the historical single fingerprint exactly (same raws,
+ * same 3440x1440 screen — byte-identical output). Variant 1 is the second
+ * identity for the lane experiment (NPG_FINGERPRINT_COUNT=2). */
+const FP_VARIANTS: FpVariantSpec[] = [
+  { label: "v0", canvasHashRaw: "hcaptcha-phase1-canvas-placeholder", parentWinHashRaw: "hcaptcha-phase1-parent-window-placeholder", performanceHashRaw: "hcaptcha-phase1-performance-placeholder", screenWidth: 3440, screenHeight: 1440, screenAvailWidth: 3440, screenAvailHeight: 1392 },
+  { label: "v1", canvasHashRaw: "npg-fp-v1-canvas-seed", parentWinHashRaw: "npg-fp-v1-parent-window-seed", performanceHashRaw: "npg-fp-v1-performance-seed", screenWidth: 2560, screenHeight: 1440, screenAvailWidth: 2560, screenAvailHeight: 1400 },
+];
 
 /** fpTemplate mirrors the reference fingerprint shape (fp_build.go in
  * Implex-ltd/hcaptcha-reverse). Placeholders: __DIF__ (difficulty), __DATA__
@@ -64,22 +79,35 @@ function fmtFloat(v: number): string {
   return digits.slice(0, point) + "." + digits.slice(point);
 }
 
-const HASH_VALS: Record<string, string> = {};
-let segBeforeDif: string, segDifToData: string, segDataToLoc: string, segLocToRand: string, segRandToStamp: string, segAfterRand: string;
-{
-  for (const f of ["canvas_hash", "parent_win_hash", "performance_hash"]) {
-    HASH_VALS[f] = hashString(HASH_RAW_BY_FIELD[f]!);
-  }
-  let tpl = FP_TEMPLATE
-    .replace("__CANVAS_HASH__", HASH_VALS["canvas_hash"]!)
-    .replace("__PARENT_WIN_HASH__", HASH_VALS["parent_win_hash"]!)
-    .replace("__PERF_HASH__", HASH_VALS["performance_hash"]!);
-  [segBeforeDif, tpl] = cut2(tpl, "__DIF__");
-  [segDifToData, tpl] = cut2(tpl, "__DATA__");
-  [segDataToLoc, tpl] = cut2(tpl, "__LOCATION__");
-  [segLocToRand, tpl] = cut2(tpl, "_rand");
-  [segRandToStamp, segAfterRand] = cut2(tpl, "__STAMP__");
+interface FpSegSet {
+  beforeDif: string;
+  difToData: string;
+  dataToLoc: string;
+  locToRand: string;
+  randToStamp: string;
+  afterRand: string;
 }
+
+/** buildSegSet pre-renders one variant's static template segments (mirrors
+ * fingerprint.go init + cut2): screen block swapped per variant, hash-class
+ * placeholders substituted from the variant's raw strings, then the template
+ * is split once at the remaining placeholder boundaries. Variant 0's replaces
+ * are identity operations, so its segments equal the historical ones. */
+function buildSegSet(v: FpVariantSpec): FpSegSet {
+  let tpl = FP_TEMPLATE
+    .replace('"width":3440,"height":1440,"avail_width":3440,"avail_height":1392}', `"width":${v.screenWidth},"height":${v.screenHeight},"avail_width":${v.screenAvailWidth},"avail_height":${v.screenAvailHeight}}`)
+    .replace("__CANVAS_HASH__", hashString(v.canvasHashRaw))
+    .replace("__PARENT_WIN_HASH__", hashString(v.parentWinHashRaw))
+    .replace("__PERF_HASH__", hashString(v.performanceHashRaw));
+  const [beforeDif, t1] = cut2(tpl, "__DIF__");
+  const [difToData, t2] = cut2(t1, "__DATA__");
+  const [dataToLoc, t3] = cut2(t2, "__LOCATION__");
+  const [locToRand, t4] = cut2(t3, "_rand");
+  const [randToStamp, afterRand] = cut2(t4, "__STAMP__");
+  return { beforeDif, difToData, dataToLoc, locToRand, randToStamp, afterRand };
+}
+
+const FP_SEG_SETS: FpSegSet[] = FP_VARIANTS.map(buildSegSet);
 
 /** locationURL normalizes the JWT "l" claim into the absolute asset URL:
  * full URL unchanged; "/c/<id>" or bare "<id>" prefixed with AssetBase
@@ -93,30 +121,62 @@ export function locationURL(loc: string): string {
 
 /** BuildFingerprint renders the hCaptcha fingerprint JSON for the challenge
  * described by pow and returns it standard-base64 encoded
- * (fingerprint.go:126-183). Throws Error on missing pow fields, stamp mint
- * failure (incl. PowBudgetExceeded) or invalid output JSON. */
-export function buildFingerprint(pow: Pow): string {
+ * (fingerprint.go:126-183). variantIndex selects the identity from the pool
+ * (default 0 = the historical single fingerprint). Throws Error on missing
+ * pow fields, stamp mint failure (incl. PowBudgetExceeded, re-thrown with
+ * the variant index appended to the message) or invalid output JSON. */
+export function buildFingerprint(pow: Pow, variantIndex = 0): string {
+  const seg = FP_SEG_SETS[Math.min(Math.max(variantIndex, 0), FP_SEG_SETS.length - 1)]!;
   if (!pow || pow.powData === "" || pow.location === "") {
     throw new Error("hcaptcha: fingerprint: pow missing data/location");
   }
-  const stamp = mintStamp(pow.difficulty * 2, pow.powData);
+  let stamp: string;
+  try {
+    stamp = mintStamp(pow.difficulty * 2, pow.powData);
+  } catch (e) {
+    if (e instanceof PowBudgetExceeded) {
+      throw new PowBudgetExceeded(e.stampBits, e.budgetMs, e.attempts, variantIndex);
+    }
+    throw e;
+  }
 
-  // Head through the comma right before the rand element (segLocToRand ends
+  // Head through the comma right before the rand element (seg.locToRand ends
   // with ","; the static rand[0] float stays in the template).
-  let head = segBeforeDif + fmtFloat(pow.difficulty) + segDifToData + pow.powData +
-    segDataToLoc + locationURL(pow.location) + segLocToRand;
+  let head = seg.beforeDif + fmtFloat(pow.difficulty) + seg.difToData + pow.powData +
+    seg.dataToLoc + locationURL(pow.location) + seg.locToRand;
 
   // CRC-32 over the payload with ",_rand" removed (rand[1] dropped; the
-  // closing bracket comes from segRandToStamp itself) + stamp + tail —
+  // closing bracket comes from seg.randToStamp itself) + stamp + tail —
   // exactly the reference builder's integrity input.
-  const crcInput = head.slice(0, -1) + segRandToStamp + stamp + segAfterRand;
+  const crcInput = head.slice(0, -1) + seg.randToStamp + stamp + seg.afterRand;
   const { randVal } = randHash(TEXT_ENCODER.encode(crcInput));
 
-  const json = head + fmtFloat(randVal) + segRandToStamp + stamp + segAfterRand;
+  const json = head + fmtFloat(randVal) + seg.randToStamp + stamp + seg.afterRand;
   try {
     JSON.parse(json);
   } catch {
     throw new Error("hcaptcha: fingerprint: produced invalid JSON");
   }
   return b64StdEncode(TEXT_ENCODER.encode(json));
+}
+
+/** Lane-sticky variant assignment: each distinct lane key (the model slug)
+ * gets a stable variant index for the process lifetime, in first-seen order.
+ * NPG_FINGERPRINT_COUNT gates the pool (default 2 —实测单指纹高频求解会触发
+ * hCaptcha 34-bit 升级、双身份分摊后全天零升级;设 1 回到历史单指纹行为,
+ * 设 3+ 进一步分摊)。每变体仅差占位原串与 screen,自洽性不受影响。 */
+const LANE_VARIANT = new Map<string, number>();
+let laneVariantNext = 0;
+export function laneVariant(lane?: string): number {
+  const count = Number(process.env.NPG_FINGERPRINT_COUNT ?? 2);
+  if (!Number.isFinite(count) || count <= 1) return 0;
+  const key = typeof lane === "string" && lane !== "" ? lane : "";
+  if (key === "") return 0;
+  let idx = LANE_VARIANT.get(key);
+  if (idx === undefined) {
+    idx = laneVariantNext % Math.floor(count);
+    laneVariantNext += 1;
+    LANE_VARIANT.set(key, idx);
+  }
+  return idx;
 }

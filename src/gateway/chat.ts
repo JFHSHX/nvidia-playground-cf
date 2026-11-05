@@ -18,7 +18,7 @@ const NON_STREAM_TIMEOUT_MS = 300_000; // 5min: NVCF 冷启动(模型实例拉�
 // --- thinking / chat_template_kwargs(reasoning.go normalizeThinking) ---
 
 interface ReasoningProfile {
-  kind: "effort" | "toggle" | "miniMax";
+  kind: "effort" | "toggle" | "miniMax" | "passthrough";
   levels: string[];
   defaultLevel: string;
 }
@@ -30,6 +30,9 @@ const REASONING_PROFILES: Record<string, ReasoningProfile> = {
   "nvidia/nemotron-3-ultra-550b-a55b": { kind: "effort", levels: ["none", "medium", "high"], defaultLevel: "high" },
   "google/diffusiongemma-26b-a4b-it": { kind: "toggle", levels: [], defaultLevel: "" },
   "minimaxai/minimax-m3": { kind: "miniMax", levels: [], defaultLevel: "" },
+  // kimi-k3_1-pro(2026-11-05 抓包):UI 顶层发 reasoning_effort:"max" 且上游 200
+  // 接受——passthrough = 顶层字段原样保留(不映射进 chat_template_kwargs)
+  "moonshotai/kimi-k3_1-pro": { kind: "passthrough", levels: ["none", "low", "medium", "high", "max"], defaultLevel: "max" },
 };
 
 const EFFORT_RANKS: Record<string, number> = {
@@ -121,10 +124,12 @@ function normalizeThinking(raw: Record<string, unknown>): void {
   delete raw["thinking"];
   delete raw["enable_thinking"];
   delete raw["clear_thinking"];
-  delete raw["reasoning_effort"];
+  if (profile?.kind !== "passthrough") delete raw["reasoning_effort"];
 
   if (profile !== null) {
-    if (profile.kind === "effort") {
+    if (profile.kind === "passthrough") {
+      // 顶层 reasoning_effort 原样透传(kimi-k3.1-pro 的 OpenAI 风格接口,UI 即如此)
+    } else if (profile.kind === "effort") {
       delete kw["enable_thinking"];
       if (hasEffort) kw["reasoning_effort"] = mapEffort(effort, profile);
       else if (enabled !== undefined) kw["reasoning_effort"] = mapEffort(enabled ? profile.defaultLevel : "none", profile);
@@ -176,11 +181,19 @@ interface ChatMessage {
   [key: string]: unknown;
 }
 
+// 每模型请求体清洗:部分后端拒绝客户端常发的字段。实测(2026-11-05 抓包)
+// kimi-k3.1-pro 的 /v1/chat/completions 对 top_p/stop/penalties 返回 400
+// (UI 从不发送它们;最小 body 200、带这些字段 400),其余嫌疑字段待逐一定位。
+const MODEL_STRIP_FIELDS: Record<string, string[]> = {
+  "moonshotai/kimi-k3.1-pro": ["top_p", "stop", "presence_penalty", "frequency_penalty"],
+};
+
 /** 组装上游请求体;返回 JSON 字符串。校验失败抛 GatewayError(400)。 */
 function buildUpstreamBody(payload: Record<string, unknown>, stream: boolean, canonicalModel: string): string {
   const body: Record<string, unknown> = { ...payload };
   normalizeThinking(body);
   body["model"] = canonicalModel;
+  for (const f of MODEL_STRIP_FIELDS[canonicalModel] ?? []) delete body[f];
   forceStreamFlag(body, stream);
   return JSON.stringify(body);
 }

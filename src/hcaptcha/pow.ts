@@ -44,8 +44,8 @@ export class PowBudgetExceeded extends Error {
   stampBits: number;
   budgetMs: number;
   attempts: number;
-  constructor(stampBits: number, budgetMs: number, attempts: number) {
-    super(`hcaptchapow: stamp search exceeded ${budgetMs}ms budget (${stampBits} bits, ${attempts} attempts)`);
+  constructor(stampBits: number, budgetMs: number, attempts: number, variant?: number) {
+    super(`hcaptchapow: stamp search exceeded ${budgetMs}ms budget (${stampBits} bits, ${attempts} attempts)${variant !== undefined && variant > 0 ? ` (fp v${variant})` : ""}`);
     this.name = "PowBudgetExceeded";
     this.stampBits = stampBits;
     this.budgetMs = budgetMs;
