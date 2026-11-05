@@ -155,3 +155,65 @@ Gateway 实现以此文件为准。
 - **predict 的 nv-function-id 与 PoW 无关**:executor 用 registry 每模型 UUID 配池供 token
   (token 模型无关);契约 `acquireNvCaptcha(): Promise<{captchaToken, functionId, expireAtMs}>`
   的 functionId 字段不参与 predict 头组装。
+
+## Playwright 抓包实测(2026-10-06,scripts/capture-network.ts,glm-5-3 手动会话)
+- UI 的 predict 与我们完全同构:`POST buildapi.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/glm-5-3`,
+  headers nv-function-id `0cd5c583-435c-4649-a621-f4e421fa12a0`(= models-snapshot.ts:110)、accept
+  `text/event-stream`、nv-captcha-token `P1_…`、无 Cookie/Authorization/priority——**无绕开队列的特殊路径**。
+- **UI 自己也吃同样的 500**:queueDepth 2090–2205 期间等 120s(x-envoy-upstream-service-time:120322)→
+  500 `"Retries exhausted: 3/3"`;500 后 ~2.5min 重发第二个 predict(新 P1_ token,同 body)。
+- UI 轮询模式:predict in-flight 期间每 ~10.5s GET `/v2/predict/queues/models/qc69jvmznzxy/{slug}`
+  (与我们 warmer 同端点、密度 6 倍;我们的 60s 在 NVIDIA 自家流量画像内);500 后停止;空闲期每 ~30s
+  GET spec(api.ngc.nvidia.com,匿名 200,keep-alive 信号)。
+- queues 响应含 functionVersionId(当日 `fec26d6c-a599-4e59-8234-487e5c1894a0`)+ queueDepth;
+  **无 cancel、无 queue-position 端点**(错误体 requestId 无对应查询/取消路径)。
+- 完整网关路径表:UI 经 Next.js Server Action(header `next-action: 40faaf4b5d5d…2916`,body
+  `["buildapi-gateway-paths.yaml"]`)取得,27 条,含 `/v3/protected/predict/stateless{/*path}`、
+  `/v3/predict/stateful{/*path}`(V3 预测 API,UI 对 glm-5-3 未用)、
+  `/v2/predict/blueprints/:orgName/:blueprintName`、`/v2/nemo-services/:orgName/:artifactName{/spec}`、
+  `/v2/build/:artifactType/:artifactName/token` 等。
+- UI 请求体差异(与拥堵无关):`stream_options.continuous_usage_stats=true`(我们强制 false)、
+  tools 数组(演示工具)、temperature 0.5、max_tokens 1024。
+- partner-endpoints:`buildapi.ngc.nvidia.com/v2/build/endpoints/{ns}/{slug}/partner-endpoints` 返回
+  第三方部署选项(GMICLOUD,USD_INPUT 0.98 / USD_OUTPUT 3.08 每 1M tokens),非拥堵相关。
+- 模型元数据 SSR 进页面 HTML(目录 API `api.ngc.nvidia.com/v2/search/catalog/resources/BLUEPRINT`
+  对 orgName qc69jvmznzxy + relatedblueprint_glm_5_3 返回空)。
+
+## V3 / 真上游探测(2026-10-06,scripts/probe-v3.ts,glm-5-3)
+- `/v3/protected/predict/*`(stateless/models/… 及 queues)→ `403 "RBAC: access denied"`:
+  路由真实存在但要账号级授权,captcha token 无用——绕不开。
+- `/v3/predict/stateless/models/{ns}/{slug}` **存在且请求形状正确**(与 v2 同构):
+  旧 token → `400 "Token is invalid"`(kaizen 格式 `urn:kaizen:problem-details:bad-request`);
+  新 token(项目管线 5.9s 铸出)→ **过验证**,转发真上游。
+- **真上游暴露在 v3 错误体里**:`504 Gateway Timeout from POST https://grpc.nvcf.nvidia.com/models/{ns}/{slug}`
+  ——buildapi 网关只是 grpc.nvcf.nvidia.com 的代理。
+- V3 **共享 v2 同一队列**(glm-5-3 depth 2112→2039,探针入队),envoy 上游超时 ~30s
+  (x-envoy-upstream-service-time 30112)→ 504 `urn:about:blank` Gateway Timeout。
+  **不是绕队通道**,但失败快(v2 是 3×80s 重试 ≈250s)。
+- 直连 `grpc.nvcf.nvidia.com/models/{ns}/{slug}` → `401 reason:"no authorization was passed
+  in the metadata"`——NVCF 元数据鉴权,captcha 无用,直连死路。
+- kimi-k3 / deepseek-v4.1-flash 的 V3 复测(同日 21:30+08):**与 glm-5-3 完全一致**——
+  能过验证、同一队列、`504 after ~30s`(grpc.nvcf.nvidia.com cause);kimi-k3 队列
+  2103→2060,deepseek 3020→3070。三个 congested 模型在 V3 上无差异,无绕队通道。
+- 队列分布(同日 21:12+08):glm-5-3 1924、kimi-k3 1956、deepseek-v4.1-flash 2984、
+  gemma-4-31b-it 587、lightning 504;**7 个模型深度 0**(nemotron-3-super/muse-glimmer/
+  nano-omni/laguna/llama-3.2-11b/ultra/gpt-oss-20b),diffusiongemma 1。拥堵是按函数的,
+  小模型全空闲。
+
+## 成功样本抓包(2026-10-06,nemotron-3-super-120b-a12b,queueDepth 0)
+- 200 成功路径与失败路径**请求形状完全一致**(nv-function-id `ac74040f-…`、P1_ token、
+  accept text/event-stream、Origin/Referer、无 Cookie/priority)——**成功也没有特殊路径**。
+- **x-envoy-upstream-service-time: 735ms**(拥堵 glm-5-3 同头是 120,322ms)——0 深度队列
+  <1s 即回;**队列深度就是唯一瓶颈**,实例有容量时 NVIDIA 响应亚秒级。
+- 200 响应**无任何特殊头**:无 rate-limit、无 queue-position、无 request-id、无新 nv-* 头
+  (只有标准安全头 + `access-control-expose-headers: *` + istio-envoy)。失败/成功信息量相同。
+- SSE 块与 glm-5-3 同构:chat.completion.chunk + reasoning_content 增量(nemotron 推理模型)
+  + 每块 usage。
+- killswitches(匿名 200):`model-page-v3-capabilities.enabled=true`(V3 能力全局开但聊天
+  仍走 v2)、`chat/select-example.enabled=true`、`chat/omit-tools=["get_current_weather"]`
+  (UI 把这个工具从请求里剔除)。
+- queues 响应(0 深度模型):functionVersionId `8ea728d2-…`、functionName
+  `ai-nemotron-3-super-120b-a12b`、ACTIVE、queueDepth 0。
+- **最终结论(两轮抓包 + V3 三路探测)**:无绕队特殊路径。UI 与我们完全同构(v2 predict +
+  P1_ captcha + 同一共享队列);V3/protected/grpc 全要账号级授权。唯一杠杆=按函数
+  queueDepth 选模型(深度 0 的 7 个模型亚秒即回)——Gateway ModelSelector 可做拥堵自动切换。

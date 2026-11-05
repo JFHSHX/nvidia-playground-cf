@@ -26,8 +26,20 @@
           name: muse-glimmer-30b
           contextWindow: 131072
           maxTokens: 131072
+        - id: minimaxai/minimax-m3.1-flash
+          name: minimax-m3.1-flash
+          contextWindow: 1000000
+          maxTokens: 131072
+        - id: mistralai/mistral-large-4-1t-a52b
+          name: mistral-large-4-1t-a52b
+          contextWindow: 262144
+          maxTokens: 131072
         - id: moonshotai/kimi-k3
           name: kimi-k3
+          contextWindow: 1048576
+          maxTokens: 131072
+        - id: moonshotai/kimi-k3_1-pro
+          name: kimi-k3_1-pro
           contextWindow: 1048576
           maxTokens: 131072
         - id: nvidia/ising-calibration-1-35b-a3b
@@ -54,6 +66,14 @@
           name: nemotron-3.5-lightning-30b-a3b
           contextWindow: 262144
           maxTokens: 262144
+        - id: nvidia/nemotron-3.5-bolt-e4b
+          name: nemotron-3.5-bolt-e4b
+          contextWindow: 131072
+          maxTokens: 32768
+        - id: nvidia/nemotron-3.5-super-vl-120b-a12b
+          name: nemotron-3.5-super-vl-120b-a12b
+          contextWindow: 262144
+          maxTokens: 262144
         - id: openai/gpt-oss-20b
           name: gpt-oss-20b
           contextWindow: 131072
@@ -61,6 +81,10 @@
         - id: poolside/laguna-xs-2.1
           name: laguna-xs-2.1
           contextWindow: 262144
+          maxTokens: 16384
+        - id: stepfun-ai/step-5-preview
+          name: step-5-preview
+          contextWindow: 1000000
           maxTokens: 16384
         - id: z-ai/glm-5-3
           name: glm-5-3
