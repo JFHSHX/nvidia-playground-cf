@@ -221,6 +221,18 @@ export type AcquireCaptcha = (lane?: string) => Promise<{ captchaToken: string }
 
 const PREDICT_ATTEMPTS_WITH_POOL = 3;
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v >= 0 ? v : dflt;
+}
+
+// no-pass 阵发重试:hCaptcha 34-bit 升级是阵发的(实测 401 后 14s 即回 1-attempt
+// ok),求解全败不立刻 401,退避后换新挑战再领,通常一两轮就过。退避期间持
+// per-model 锁(throttleFor 串行)顺带挡住同 lane 后续请求在尖峰窗口里继续喂
+// claim(每一发都是白耗 33s 的求解)。
+const CAPTCHA_RETRY_ROUNDS = Math.max(1, Math.floor(envNum("NPG_CAPTCHA_RETRY_ROUNDS", 3)));
+const CAPTCHA_RETRY_BASE_MS = envNum("NPG_CAPTCHA_RETRY_MS", 5000);
+
 export interface PredictHeaders {
   "Content-Type": string;
   Accept: string;
@@ -280,19 +292,34 @@ export async function doPredict(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let token = clientToken;
     if (token === "") {
-      let acquired: { captchaToken: string };
-      try {
-        acquired = await acquireCaptcha(info.slug);
-      } catch (err) {
-        // 求解失败:池空 → 503;取消 → 408;其余 → 401
-        const msg = err instanceof Error ? err.message : String(err);
-        if (signal?.aborted) {
-          throw new GatewayError(408, "client_cancelled", `client cancelled during captcha solve: ${msg}`);
+      let acquired: { captchaToken: string } | null = null;
+      let lastErr = "";
+      for (let round = 1; round <= CAPTCHA_RETRY_ROUNDS; round++) {
+        try {
+          acquired = await acquireCaptcha(info.slug);
+          break;
+        } catch (err) {
+          // 池空 → 503(不重试);取消 → 408;其余 = 求解 no-pass(34-bit 尖峰
+          // 阵发)→ 退避换新挑战再领
+          const msg = err instanceof Error ? err.message : String(err);
+          if (signal?.aborted) {
+            throw new GatewayError(408, "client_cancelled", `client cancelled during captcha solve: ${msg}`);
+          }
+          if (msg.includes("pool empty") || msg.includes("captcha pool")) {
+            throw new GatewayError(503, "captcha_pool_empty", `${msg}; retry later`);
+          }
+          lastErr = msg;
+          if (round >= CAPTCHA_RETRY_ROUNDS) break;
+          const delay = CAPTCHA_RETRY_BASE_MS * round;
+          console.error(`[npg-gw] captcha no-pass (difficulty spike), retry ${round}/${CAPTCHA_RETRY_ROUNDS - 1} in ${delay}ms [${info.slug}]: ${msg}`);
+          await new Promise((r) => setTimeout(r, delay));
+          if (signal?.aborted) {
+            throw new GatewayError(408, "client_cancelled", "client cancelled during captcha retry wait");
+          }
         }
-        if (msg.includes("pool empty") || msg.includes("captcha pool")) {
-          throw new GatewayError(503, "captcha_pool_empty", `${msg}; retry later`);
-        }
-        throw new GatewayError(401, "captcha_error", msg);
+      }
+      if (acquired === null) {
+        throw new GatewayError(401, "captcha_error", lastErr);
       }
       token = acquired.captchaToken;
     }

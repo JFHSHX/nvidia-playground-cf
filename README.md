@@ -83,6 +83,7 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 - **per-model 节流**：不同模型 = 不同 NVCF 函数 = 不同共享队列，互相并行；同模型串行 + 最小间隔（默认 3s，`NPG_CHAT_INTERVAL_MS`）——并行高频求解会触发 hCaptcha 34-bit 难度升级。
 - **TS 指纹池**：默认 2 身份、lane（模型 slug）粘性分配，分摊求解频率。变体只换占位原串 + 屏幕尺寸（UA/common_keys 自洽不动）。单指纹高频曾触发 34-bit 升级（2^34 次 SHA-1 不可行），双身份后全天零升级。`NPG_FINGERPRINT_COUNT=1` 回历史单指纹。
 - **难度尖峰阶梯**：挑战难度由服务端定，尖峰挑战（s=17 → 2^34 章戳搜索）直接放弃重领，最多 3 轮；章戳搜索有 10s 预算护栏（`PowBudgetExceeded`）。
+- **no-pass 阵发自愈**：单模型连发也会触发 34-bit 阵发（升级针对单 lane 高频 claim，指纹池只分摊多模型负载）；实测 401 后 ~14s 即回 1-attempt ok——网关侧 no-pass 不立刻 401，退避 5s/10s 换新挑战重领（默认 3 轮），退避期间持 per-model 锁，顺带挡住同 lane 在尖峰窗口继续白耗求解。
 - **502 队列诊断**：上游 `Retries exhausted`（NVIDIA 网关 3×80s 内部重试失败）时自动查免认证 queues 端点，502 错误体带 `queueDepth` 与实例状态。
 - **退化响应重试**：空 content / reasoning 单字符重复循环（"!!!!…"）检出即整条废弃换新 token 重试，最多 2 次；SSE 在头部 reasoning delta 到达客户端前拦截。
 - **流中止防护**：上游 h2 流中止/客户端断开不炸进程（undici "terminated" 竞态降级为日志）；客户端断开主动断上游流。
@@ -97,6 +98,8 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 | `NPG_SOLVER` | `browser` | `vm` = node:vm 解算（当前 wasm 会挂，仅调试） |
 | `NPG_FINGERPRINT_COUNT` | `2` | 指纹池身份数；`1` = 历史单指纹 |
 | `NPG_CHAT_INTERVAL_MS` | `3000` | 同模型请求最小间隔 |
+| `NPG_CAPTCHA_RETRY_ROUNDS` | `3` | 求解 no-pass 后的换挑战重试轮数（34-bit 阵发自愈）；`1` = 关闭 |
+| `NPG_CAPTCHA_RETRY_MS` | `5000` | 重试退避基数（第 n 轮等 base×n ms） |
 | `NPG_KEEPALIVE_MODELS` | `""`（关） | 逗号分隔模型 id，队列感知预热（保实例温度）；队列深 >32 自动跳过。⚠️ PS 里 `$env:X=""` 是删变量，要禁用请用 `","` |
 | `NPG_KEEPALIVE_MS` | `60000` | 预热节奏 |
 | `NPG_KEEPALIVE_MAX_QUEUE` | `32` | 超过此队列深度跳过预热 |
