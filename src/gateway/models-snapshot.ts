@@ -10,7 +10,9 @@
 
 export const PREDICT_BASE = "https://buildapi.ngc.nvidia.com";
 export const DEFAULT_NAMESPACE = "qc69jvmznzxy";
-export const DEFAULT_MODEL = "moonshotai/kimi-k3";
+// 缺省必须指向活函数:kimi-k3 已于 2026-10-17 永久下线;kimi-k3_1-pro
+// 2026-11-14 实测复活(queues 200 / ACTIVE),缺省 model 的请求不再打死函数。
+export const DEFAULT_MODEL = "moonshotai/kimi-k3_1-pro";
 
 export function predictEndpoint(info: ModelInfo): string {
   return `${PREDICT_BASE}/v2/predict/models/${info.namespace}/${info.slug}`;

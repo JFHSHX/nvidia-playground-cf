@@ -1,6 +1,6 @@
 # nvidia-playground-cf
 
-把 [NVIDIA Build Playground](https://build.nvidia.com) 的匿名聊天模型包装成 **OpenAI 兼容 API**（`http://localhost:8787/v1`），免账号、免 API key。认证链路 = 完整 hCaptcha PoW 求解（checksiteconfig → hashcash 章戳 + 指纹 → hsw wasm → getcaptcha → `P1_` token），每次请求全新铸出。
+把 [NVIDIA Build Playground](https://build.nvidia.com) 的匿名聊天模型包装成 **OpenAI 兼容 API**（`http://localhost:8787/v1`），免账号、免 API key。认证链路 = 完整 hCaptcha PoW 求解（checksiteconfig → hashcash 章戳 + 指纹 → hsw wasm → getcaptcha → `P1_` token），每次请求使用全新的一次性 token（Node 宿主按 lane 滴灌预铸，绝不复用）。
 
 移植自 [6Kmfi6HP/nvidia-playgroud-go](https://github.com/6Kmfi6HP/nvidia-playgroud-go)（Go + v8go），重写为 **Windows 原生 Node + Playwright**——全部求解/网关逻辑零运行时依赖（运行时仅 playwright）。
 
@@ -28,7 +28,7 @@ npm run typecheck                  # tsc 双配置零错误
 
 | 端点 | 说明 |
 |---|---|
-| `GET /healthz` | `{status, models, runtime, solver}` |
+| `GET /healthz` | `{status, models, runtime, solver, captchaPool}` |
 | `GET /v1/models` | OpenAI 模型列表（23 模型静态快照） |
 | `POST /v1/chat/completions` | OpenAI 兼容，`stream: true`（SSE 逐字节透传）/ `false`（聚合） |
 
@@ -46,7 +46,7 @@ body.json 最小示例：
 
 ### 模型与 pin
 
-- **23 模型快照**（`src/gateway/models-snapshot.ts`，2026-11-05 目录核对）：deepseek-v4.1-flash、glm-5-3 / glm-5-3-flash、kimi-k3_1-pro（1M 上下文）、minimax-m3.1-flash、mistral-large-4-1t、step-5-preview、nemotron 家族（3-super / 3-ultra / 3.5-super-vl / 3.5-bolt / nano-omni）、gpt-oss-20b、laguna-xs、llama-3.2-vision 等。
+- **23 模型快照**（`src/gateway/models-snapshot.ts`，2026-11-05 目录核对）：deepseek-v4.1-flash、glm-5-3 / glm-5-3-flash、kimi-k3_1-pro（1M 上下文）、minimax-m3.1-flash、mistral-large-4-1t、step-5-preview、nemotron 家族（3-super / 3-ultra / 3.5-super-vl / 3.5-bolt / nano-omni）、gpt-oss-20b、laguna-xs、llama-3.2-vision 等。缺省 `model` = `moonshotai/kimi-k3_1-pro`（旧默认 kimi-k3 已永久下线）。
 - **快照外模型也能调**：`"model": "<functionId>@<publisher>/<slug>"`（body pin 最优先），或请求头 `nv-function-id` + `nv-function-slug`（+ 可选 `nv-function-namespace`）——fnId 可从模型 playground 页 SSR 的 `nvcfFunctionId` 抓到。
 - 自带 `nv-captcha-token` 请求头可跳过求解（token 单次有效、寿命 2-3 分钟；池供 token 时 captcha 失败最多换 3 次新 token 重试）。
 
@@ -69,6 +69,7 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
   → hCaptcha 管线:checksiteconfig → PoW(hashcash 章戳 + 指纹构建,TS 零依赖)
     → headless Chromium page.evaluate 跑 window.hsw(求解 + wasm 加解密)
     → getcaptcha(msgpack [c-spec, ext18(cipher)] 加密提交)→ P1_ token
+    → per-lane 滴灌池（FIFO 预铸/过期回收/空闲停机；池空按需现铸）
   → predict:POST buildapi.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/{slug}
     (nv-function-id + nv-captcha-token + Origin/Referer,无 Cookie/Authorization)
   → SSE 透传 / 非流式聚合(JSON-first,SSE 兜底)
@@ -84,9 +85,10 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 - **TS 指纹池**：默认 2 身份、lane（模型 slug）粘性分配，分摊求解频率。变体只换占位原串 + 屏幕尺寸（UA/common_keys 自洽不动）。单指纹高频曾触发 34-bit 升级（2^34 次 SHA-1 不可行），双身份后全天零升级。`NPG_FINGERPRINT_COUNT=1` 回历史单指纹。
 - **难度预检立即弃坑**：claim JWT 的难度在求解前就可读（`parsePow` 返回 difficulty，s×2 = 章戳位数），超阈值（池 24 / 无池 18 bits，`NPG_MAX_STAMP_BITS`）直接放弃换新 claim——之前 34-bit 尖峰要先烧满 10s 预算才发现解不动，3 轮 = 33s 纯烧 CPU，现在尖峰轮成本 ~0s。
 - **多核章戳池**：`src/node-host/stamp-pool.ts`（worker_threads 分片，stride = worker 数，与 Go stamp.go:64-79 同构）。之前 `mintStamp` 同步搜索会冻结整个 Node 事件循环 10s×3（所有模型、keep-alive、健康检查全卡死）；现在 >10 bits 起池、事件循环不冻结，N 核 ≈ N 倍速（`NPG_STAMP_WORKERS`，默认 min(核数-1, 8)）。
+- **token 滴灌池**：每 lane 默认预存 1 个一次性 token，取用后 15s 后台补 1 个，求解与上游排队重叠；池空/预铸未完成时共享同一次按需求解，绝不并发重复 claim。FIFO、90s TTL + 5s 鲜度余量、失败指数退避（5–60s）、5 分钟无取用自动清空停机；懒启动，不在 boot 白解。`NPG_CAPTCHA_POOL_SIZE=0` 回每次现铸。
 - **难度尖峰阶梯**：挑战难度由服务端定，尖峰挑战（s=17 → 2^34 章戳搜索）直接放弃重领，最多 3 轮；章戳搜索有 10s 预算护栏（`PowBudgetExceeded`）。
 - **no-pass 阵发自愈**：单模型连发也会触发 34-bit 阵发（升级针对单 lane 高频 claim，指纹池只分摊多模型负载）；实测 401 后 ~14s 即回 1-attempt ok——网关侧 no-pass 不立刻 401，退避 5s/10s 换新挑战重领（默认 3 轮），退避期间持 per-model 锁，顺带挡住同 lane 在尖峰窗口继续白耗求解。
-- **502 队列诊断**：上游 `Retries exhausted`（NVIDIA 网关 3×80s 内部重试失败）时自动查免认证 queues 端点，502 错误体带 `queueDepth` 与实例状态。
+- **502 队列诊断**：上游 `Retries exhausted`（NVIDIA 网关 3×80s 内部重试失败）或 `Pool#acquire ... configured timeout`（后端连接池 45s 无执行槽）时自动查免认证 queues 端点，统一返回 `upstream_queue_overloaded`，502 错误体带 `queueDepth` 与实例状态。
 - **退化响应重试**：空 content / reasoning 单字符重复循环（"!!!!…"）检出即整条废弃换新 token 重试，最多 2 次；SSE 在头部 reasoning delta 到达客户端前拦截。
 - **流中止防护**：上游 h2 流中止/客户端断开不炸进程（undici "terminated" 竞态降级为日志）；客户端断开主动断上游流。
 - **每模型字段清洗**：如 kimi-k3.1-pro 拒收 `top_p/stop/presence_penalty/frequency_penalty`（400，UI 从不发送）——按 canonicalModel 剥掉（`MODEL_STRIP_FIELDS`）。
@@ -102,12 +104,15 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 | `NPG_CHAT_INTERVAL_MS` | `3000` | 同模型请求最小间隔 |
 | `NPG_CAPTCHA_RETRY_ROUNDS` | `3` | 求解 no-pass 后的换挑战重试轮数（34-bit 阵发自愈）；`1` = 关闭 |
 | `NPG_CAPTCHA_RETRY_MS` | `5000` | 重试退避基数（第 n 轮等 base×n ms） |
+| `NPG_CAPTCHA_POOL_SIZE` | `1` | 每 lane 预铸 token 数；`0` = 关闭滴灌池、每次现铸 |
+| `NPG_CAPTCHA_POOL_REFILL_MS` | `15000` | 取用/过期后的后台预补延迟；真实请求不等计时器，缺 token 立即现铸 |
+| `NPG_CAPTCHA_POOL_IDLE_MS` | `300000` | lane 无取用多久后清空并停止后台求解（5 分钟） |
 | `NPG_MAX_STAMP_BITS` | 池 24 / 无池 18 | 难度预检阈值（章戳位数 = JWT s×2）：超过即放弃该 claim 换新，不烧 10s 预算 |
 | `NPG_STAMP_WORKERS` | min(核数-1, 8) | 多核章戳池的 worker 数（>10 bits 起池，stride 分片） |
 | `NPG_KEEPALIVE_MODELS` | `""`（关） | 逗号分隔模型 id，队列感知预热（保实例温度）；队列深 >32 自动跳过。⚠️ PS 里 `$env:X=""` 是删变量，要禁用请用 `","` |
 | `NPG_KEEPALIVE_MS` | `60000` | 预热节奏 |
 | `NPG_KEEPALIVE_MAX_QUEUE` | `32` | 超过此队列深度跳过预热 |
-| `NPG_DEBUG_BODY` | 关 | `=1` 时上游 4xx/5xx 把发上去的请求体（截 4KB）记日志——定位字段级 400 用 |
+| `NPG_DEBUG_BODY` | 关 | `=1` 记录我方请求体（截 4KB）；`=2` 额外记录**完整上游错误体**——定位字段级 400 用，只写本地日志 |
 | `NPG_CAPTURE_HEADLESS` | 关 | 抓包脚本强制无头 |
 
 ## 运维：拥堵与下架（实测运维学）
@@ -132,6 +137,8 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 |---|---|
 | `npx tsx scripts/verify-fp-pool.ts` | 指纹池自测 13/13（确定性/变体差异/lane 粘性/默认 2） |
 | `npx tsx scripts/verify-stamp-pool.ts` | 多核章戳池自测（格式/checkStamp/事件循环不冻结/多核加速对比） |
+| `npx tsx scripts/verify-token-pool.ts` | token 滴灌池自测（懒启动/命中/单 in-flight/失败/过期/空闲） |
+| `npx tsx scripts/verify-reliability.ts` | P0/P1 回归（活默认模型/Pool#acquire 诊断/完整错误体日志） |
 | `npx tsx scripts/probe-predict.ts [model]` | 自铸 token 直连 v2 predict，A/B/C… 变体字段二分定位 400 |
 | `npx tsx scripts/probe-v3.ts [model]` | V3 stateless 路径探测（已证同队列、30s 快失败） |
 | `npx tsx scripts/list-models.ts` | 真浏览器抓 playground 目录，对比快照发现新模型 |

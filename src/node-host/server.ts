@@ -8,6 +8,7 @@ import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { handleChatCompletions } from "../gateway/chat";
 import { MODEL_SNAPSHOT, DEFAULT_MODEL } from "../gateway/models-snapshot";
 import { setSolveOverride, setStampPool } from "../hcaptcha/getcaptcha";
+import { captchaTokenPoolStats, configureCaptchaTokenPool } from "../hcaptcha";
 import { mintStampAsync } from "./stamp-pool";
 import { solveN as vmSolveN, cryptoMode as vmCryptoMode } from "./hsw-node";
 import { browserSolveN, browserCryptoMode } from "./browser-solver";
@@ -49,6 +50,18 @@ const SOLVER_NAME = (process.env.NPG_SOLVER ?? "browser");
 
 // B: 多核章戳池(worker_threads 分片,事件循环不冻结);阈值自动升 24 bits。
 setStampPool(mintStampAsync);
+
+// C: per-lane token 滴灌池。懒启动(不在 boot 白解)、每 lane 单 in-flight,
+// 命中后 15s 预补,5 分钟无取用自动停;池空仍走按需现铸,不引入 pool-empty。
+const CAPTCHA_POOL_SIZE = Number(process.env.NPG_CAPTCHA_POOL_SIZE ?? 1);
+configureCaptchaTokenPool({
+  size: CAPTCHA_POOL_SIZE,
+  refillMs: Number(process.env.NPG_CAPTCHA_POOL_REFILL_MS ?? 15_000),
+  idleMs: Number(process.env.NPG_CAPTCHA_POOL_IDLE_MS ?? 300_000),
+});
+if (Number.isFinite(CAPTCHA_POOL_SIZE) && CAPTCHA_POOL_SIZE > 0) {
+  console.log(`captcha drip pool on: ${Math.floor(CAPTCHA_POOL_SIZE)} token/lane, lazy refill, idle stop`);
+}
 
 // --- keep-alive warmer:保持 NVCF 实例温热(队列感知) ---
 // 实例缩容后,下一次真实请求会撞上冷启动(可用模型 5-30s)或直接 502
@@ -208,7 +221,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     if (url.pathname === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", models: Object.keys(MODEL_SNAPSHOT).length, runtime: "node", solver: SOLVER_NAME }));
+      res.end(JSON.stringify({ status: "ok", models: Object.keys(MODEL_SNAPSHOT).length, runtime: "node", solver: SOLVER_NAME, captchaPool: captchaTokenPoolStats() }));
       return;
     }
     if (url.pathname === "/v1/models") {

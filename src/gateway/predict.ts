@@ -181,6 +181,15 @@ interface UpstreamErrorShape {
   requestStatus?: { statusCode?: string; statusDescription?: string; requestId?: string };
 }
 
+/** NVIDIA 共享队列/连接池耗尽的两种实测错误:
+ * - Retries exhausted: 网关内部 3 次排队重试失败;
+ * - Pool#acquire ... configured timeout: 后端连接池 45s 拿不到执行槽。
+ * 两者都应附 queues 深度,而不是误报成普通 upstream_error。 */
+export function isQueueOverloadFailure(raw: string): boolean {
+  if (raw.includes("Retries exhausted")) return true;
+  return raw.includes("Pool#acquire") && raw.includes("configured timeout");
+}
+
 /** 4xx 且 body 提示 token/captcha 问题 → 可换新 token 重试。 */
 export function isRetryableCaptchaFailure(status: number, raw: string): boolean {
   if (status < 400 || status >= 500) return false;
@@ -342,7 +351,8 @@ export async function doPredict(
 
     if (resp.status < 400) return resp;
 
-    // 读错误体(限 4KB)。text() 已消费并关闭 body——**不要调用 body.cancel()**:
+    // 完整读错误体(供 NPG_DEBUG_BODY=2;默认消息由 upstreamErrorMessage 截短)。
+    // text() 已消费并关闭 body——**不要调用 body.cancel()**:
     // Node webstreams 中已锁定的流 cancel 会抛 ERR_INVALID_STATE(ReadableStream
     // is locked),其 Promise rejection 还会成为未处理拒绝;Go 版 CloseBody 的
     // "close failure has no effect" 语义在这里不适用。
@@ -351,18 +361,23 @@ export async function doPredict(
 
     // NPG_DEBUG_BODY=1:上游 4xx/5xx 时把发上去的请求体(截断)记进日志——实测
     // glm-5-3-flash / nemotron-ultra 的 400 上游 cause 会被截断在 URL 中间,
-    // 看不到被拒的确切字段。默认关闭,只在需要定位时开。
-    if (process.env.NPG_DEBUG_BODY === "1") {
+    // 看不到被拒的确切字段。=2 额外记录完整上游错误体(默认错误消息仍截短,
+    // 完整内容只进本地日志)。默认关闭,只在需要定位时开。
+    const debugBody = process.env.NPG_DEBUG_BODY ?? "";
+    if (debugBody === "1" || debugBody === "2") {
       const cap = 4 * 1024;
       console.error(
         `[npg-gw] upstream ${resp.status} on ${endpoint}; request body: ${body.length > cap ? `${body.slice(0, cap)}…(+${body.length - cap}B truncated)` : body}`,
       );
     }
+    if (debugBody === "2") {
+      console.error(`[npg-gw] upstream ${resp.status} on ${endpoint}; complete response body (${raw.length}B): ${raw}`);
+    }
 
-    if (raw.includes("Retries exhausted")) {
-      // NVIDIA 网关自己的 3 次内部重试(~80s each)已放弃:共享队列拥堵
-      // (实测 glm-5-3 queueDepth 900-1150)或实例不可达。我们的再试只会
-      // 再排一次队,直接查一次队列深度(免认证)把根因带回给调用方。
+    if (isQueueOverloadFailure(raw)) {
+      // Retries exhausted = NVIDIA 网关自己的 3 次内部重试已放弃;
+      // Pool#acquire timeout = 后端连接池 45s 仍拿不到执行槽。两者都是共享
+      // 实例拥堵,再试只会再排一次队;查一次免认证队列深度把根因带回调用方。
       const hint = await queueDepthHint(info);
       throw new GatewayError(502, "upstream_queue_overloaded", `upstream: ${upstreamErrorMessage(raw)}${hint}`);
     }
