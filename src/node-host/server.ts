@@ -7,7 +7,8 @@ import { Readable } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { handleChatCompletions } from "../gateway/chat";
 import { MODEL_SNAPSHOT, DEFAULT_MODEL } from "../gateway/models-snapshot";
-import { setSolveOverride } from "../hcaptcha/getcaptcha";
+import { setSolveOverride, setStampPool } from "../hcaptcha/getcaptcha";
+import { mintStampAsync } from "./stamp-pool";
 import { solveN as vmSolveN, cryptoMode as vmCryptoMode } from "./hsw-node";
 import { browserSolveN, browserCryptoMode } from "./browser-solver";
 import { initFileLog } from "./logger";
@@ -45,6 +46,9 @@ if ((process.env.NPG_SOLVER ?? "browser") === "vm") {
   setSolveOverride({ solveN: browserSolveN, cryptoMode: browserCryptoMode });
 }
 const SOLVER_NAME = (process.env.NPG_SOLVER ?? "browser");
+
+// B: 多核章戳池(worker_threads 分片,事件循环不冻结);阈值自动升 24 bits。
+setStampPool(mintStampAsync);
 
 // --- keep-alive warmer:保持 NVCF 实例温热(队列感知) ---
 // 实例缩容后,下一次真实请求会撞上冷启动(可用模型 5-30s)或直接 502

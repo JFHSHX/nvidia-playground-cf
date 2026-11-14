@@ -126,19 +126,37 @@ export function locationURL(loc: string): string {
  * pow fields, stamp mint failure (incl. PowBudgetExceeded, re-thrown with
  * the variant index appended to the message) or invalid output JSON. */
 export function buildFingerprint(pow: Pow, variantIndex = 0): string {
+  return renderFingerprint(pow, variantIndex, () => mintStamp(pow.difficulty * 2, pow.powData)) as string;
+}
+
+/** buildFingerprintAsync:B 多核章戳路径——stamp 由 Node host 的 worker pool
+ * 铸造(事件循环不冻结);渲染逻辑与同步版完全同源(renderFingerprint)。 */
+export async function buildFingerprintAsync(
+  pow: Pow,
+  variantIndex: number,
+  mint: (bits: number, data: string) => Promise<string>,
+): Promise<string> {
+  return renderFingerprint(pow, variantIndex, () => mint(pow.difficulty * 2, pow.powData));
+}
+
+function renderFingerprint(pow: Pow, variantIndex: number, mint: () => string | Promise<string>): string | Promise<string> {
   const seg = FP_SEG_SETS[Math.min(Math.max(variantIndex, 0), FP_SEG_SETS.length - 1)]!;
   if (!pow || pow.powData === "" || pow.location === "") {
     throw new Error("hcaptcha: fingerprint: pow missing data/location");
   }
-  let stamp: string;
+  const onStamp = (stamp: string): string => finishFingerprint(pow, seg, stamp, variantIndex);
   try {
-    stamp = mintStamp(pow.difficulty * 2, pow.powData);
+    const stamp = mint();
+    return stamp instanceof Promise ? stamp.then(onStamp) : onStamp(stamp);
   } catch (e) {
     if (e instanceof PowBudgetExceeded) {
       throw new PowBudgetExceeded(e.stampBits, e.budgetMs, e.attempts, variantIndex);
     }
     throw e;
   }
+}
+
+function finishFingerprint(pow: Pow, seg: FpSegSet, stamp: string, _variantIndex: number): string {
 
   // Head through the comma right before the rand element (seg.locToRand ends
   // with ","; the static rand[0] float stays in the template).

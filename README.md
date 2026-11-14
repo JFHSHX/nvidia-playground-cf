@@ -82,6 +82,8 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 
 - **per-model 节流**：不同模型 = 不同 NVCF 函数 = 不同共享队列，互相并行；同模型串行 + 最小间隔（默认 3s，`NPG_CHAT_INTERVAL_MS`）——并行高频求解会触发 hCaptcha 34-bit 难度升级。
 - **TS 指纹池**：默认 2 身份、lane（模型 slug）粘性分配，分摊求解频率。变体只换占位原串 + 屏幕尺寸（UA/common_keys 自洽不动）。单指纹高频曾触发 34-bit 升级（2^34 次 SHA-1 不可行），双身份后全天零升级。`NPG_FINGERPRINT_COUNT=1` 回历史单指纹。
+- **难度预检立即弃坑**：claim JWT 的难度在求解前就可读（`parsePow` 返回 difficulty，s×2 = 章戳位数），超阈值（池 24 / 无池 18 bits，`NPG_MAX_STAMP_BITS`）直接放弃换新 claim——之前 34-bit 尖峰要先烧满 10s 预算才发现解不动，3 轮 = 33s 纯烧 CPU，现在尖峰轮成本 ~0s。
+- **多核章戳池**：`src/node-host/stamp-pool.ts`（worker_threads 分片，stride = worker 数，与 Go stamp.go:64-79 同构）。之前 `mintStamp` 同步搜索会冻结整个 Node 事件循环 10s×3（所有模型、keep-alive、健康检查全卡死）；现在 >10 bits 起池、事件循环不冻结，N 核 ≈ N 倍速（`NPG_STAMP_WORKERS`，默认 min(核数-1, 8)）。
 - **难度尖峰阶梯**：挑战难度由服务端定，尖峰挑战（s=17 → 2^34 章戳搜索）直接放弃重领，最多 3 轮；章戳搜索有 10s 预算护栏（`PowBudgetExceeded`）。
 - **no-pass 阵发自愈**：单模型连发也会触发 34-bit 阵发（升级针对单 lane 高频 claim，指纹池只分摊多模型负载）；实测 401 后 ~14s 即回 1-attempt ok——网关侧 no-pass 不立刻 401，退避 5s/10s 换新挑战重领（默认 3 轮），退避期间持 per-model 锁，顺带挡住同 lane 在尖峰窗口继续白耗求解。
 - **502 队列诊断**：上游 `Retries exhausted`（NVIDIA 网关 3×80s 内部重试失败）时自动查免认证 queues 端点，502 错误体带 `queueDepth` 与实例状态。
@@ -100,6 +102,8 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 | `NPG_CHAT_INTERVAL_MS` | `3000` | 同模型请求最小间隔 |
 | `NPG_CAPTCHA_RETRY_ROUNDS` | `3` | 求解 no-pass 后的换挑战重试轮数（34-bit 阵发自愈）；`1` = 关闭 |
 | `NPG_CAPTCHA_RETRY_MS` | `5000` | 重试退避基数（第 n 轮等 base×n ms） |
+| `NPG_MAX_STAMP_BITS` | 池 24 / 无池 18 | 难度预检阈值（章戳位数 = JWT s×2）：超过即放弃该 claim 换新，不烧 10s 预算 |
+| `NPG_STAMP_WORKERS` | min(核数-1, 8) | 多核章戳池的 worker 数（>10 bits 起池，stride 分片） |
 | `NPG_KEEPALIVE_MODELS` | `""`（关） | 逗号分隔模型 id，队列感知预热（保实例温度）；队列深 >32 自动跳过。⚠️ PS 里 `$env:X=""` 是删变量，要禁用请用 `","` |
 | `NPG_KEEPALIVE_MS` | `60000` | 预热节奏 |
 | `NPG_KEEPALIVE_MAX_QUEUE` | `32` | 超过此队列深度跳过预热 |
@@ -127,6 +131,7 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 | 脚本 | 用途 |
 |---|---|
 | `npx tsx scripts/verify-fp-pool.ts` | 指纹池自测 13/13（确定性/变体差异/lane 粘性/默认 2） |
+| `npx tsx scripts/verify-stamp-pool.ts` | 多核章戳池自测（格式/checkStamp/事件循环不冻结/多核加速对比） |
 | `npx tsx scripts/probe-predict.ts [model]` | 自铸 token 直连 v2 predict，A/B/C… 变体字段二分定位 400 |
 | `npx tsx scripts/probe-v3.ts [model]` | V3 stateless 路径探测（已证同队列、30s 快失败） |
 | `npx tsx scripts/list-models.ts` | 真浏览器抓 playground 目录，对比快照发现新模型 |

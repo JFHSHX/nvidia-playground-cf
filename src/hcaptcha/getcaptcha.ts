@@ -14,10 +14,37 @@
 // minimalMotionData, locationVersion, clipBytes, CaptchaToken — rebuilt from
 // the doc comments and test assertions; CaptchaTokenDetail is not ported.
 // All solver/network phases are async (TS), unlike the Go sync http client.
-import { parsePow } from "./pow";
-import { buildFingerprint, laneVariant } from "./fingerprint";
+import { parsePow, mintStamp as mintStampSync } from "./pow";
+import { buildFingerprintAsync, laneVariant } from "./fingerprint";
 import { solveN as solveNWorkerd, cryptoMode as cryptoModeWorkerd, locationFromJWT, HSW_UA } from "./runner";
 import { msgpackDecode, msgpackEncodeMapString, msgpackEncodeWire } from "./msgpack";
+
+/** A 难度预检阈值(章戳位数 = JWT s*2):超过即放弃该 claim 换新,不烧 10s 预算。
+ * Node host 装 stamp-pool(多核)后默认 24 bits;workerd/未装池时 18 bits——
+ * 单线程 ~300K H/s 下 18 bits 平均 ~1s,留足 10s 预算余量。NPG_MAX_STAMP_BITS
+ * 显式覆盖。 */
+function maxStampBits(): number {
+  const env = Number(process.env.NPG_MAX_STAMP_BITS);
+  if (Number.isFinite(env) && env > 0) return Math.floor(env);
+  const g = globalThis as unknown as { __npgStampPool?: { search?: unknown } };
+  return typeof g.__npgStampPool?.search === "function" ? 24 : 18;
+}
+
+type StampMint = (bits: number, data: string) => Promise<string>;
+let stampPool: StampMint | null = null;
+/** Node host 启动时装配(src/node-host/stamp-pool.ts 的 mintStampAsync);
+ * 未装配走同步 mintStamp(workerd 单线程路径)。 */
+export function setStampPool(mint: StampMint | null): void {
+  stampPool = mint;
+  (globalThis as unknown as { __npgStampPool?: unknown }).__npgStampPool = mint;
+}
+
+/** B:有池走多核异步(不冻事件循环),无池回退同步 mintStamp。签名与
+ * buildFingerprintAsync 的 mint 回调一致(bits, data)。 */
+async function mintStampFor(bits: number, data: string): Promise<string> {
+  if (stampPool) return stampPool(bits, data);
+  return mintStampSync(bits, data);
+}
 
 /** Solver override: a Node host (src/node-host) injects its own vm-based
  * runner at startup; when unset the workerd Worker Loader path is used. */
@@ -383,9 +410,12 @@ export async function captchaAttempts(sitekey: string, host: string, lane?: stri
   } catch (e) {
     throw new Error(`hcaptcha: getcaptcha: parse pow: ${e instanceof Error ? e.message : String(e)}`);
   }
+  if (pow.difficulty * 2 > maxStampBits()) {
+    throw new Error(`hcaptcha: getcaptcha: challenge too hard (s=${pow.difficulty}, ${pow.difficulty * 2} bits > NPG_MAX_STAMP_BITS=${maxStampBits()}); abandoning`);
+  }
   let fpB64: string;
   try {
-    fpB64 = buildFingerprint(pow, laneVariant(lane));
+    fpB64 = await buildFingerprintAsync(pow, laneVariant(lane), mintStampFor);
   } catch (e) {
     throw new Error(`hcaptcha: getcaptcha: build fingerprint: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -493,9 +523,19 @@ async function runEncryptedAttempt(sitekey: string, host: string, claim: GcHttpR
     at.elapsedMs = Date.now() - t0;
     return [at, info];
   }
+  // A: 难度预检立即弃坑——claim JWT 的 s 在求解前就可读(parsePow 返回
+  // difficulty),s*2 = 章戳位数。34-bit 尖峰(实测 s=17)之前要先烧满 10s 预算
+  // 才发现解不动,3 轮 = 33s 纯烧 CPU;这里超阈值直接返回失败,captchaAttempts
+  // 的 abandon+re-claim 阶梯立即换新 claim,尖峰轮成本 ~0s。
+  const maxBits = maxStampBits();
+  if (pow.difficulty * 2 > maxBits) {
+    at.err = `hcaptcha: getcaptcha: claimed challenge too hard (s=${pow.difficulty}, ${pow.difficulty * 2} bits > NPG_MAX_STAMP_BITS=${maxBits}); abandoning to re-claim`;
+    at.elapsedMs = Date.now() - t0;
+    return [at, info];
+  }
   let fpB64: string;
   try {
-    fpB64 = buildFingerprint(pow, laneVariant(lane));
+    fpB64 = await buildFingerprintAsync(pow, laneVariant(lane), mintStampFor);
   } catch (e) {
     at.err = `hcaptcha: getcaptcha: build claimed fingerprint: ${e instanceof Error ? e.message : String(e)}`;
     at.elapsedMs = Date.now() - t0;
