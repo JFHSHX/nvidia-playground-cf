@@ -34,12 +34,15 @@
           name: mistral-large-4-1t-a52b
           contextWindow: 262144
           maxTokens: 131072
-        - id: moonshotai/kimi-k3
-          name: kimi-k3
-          contextWindow: 1048576
-          maxTokens: 131072
+        # 已下架(2026-10-17):queues 404,请求 502 upstream 404
+        # - id: moonshotai/kimi-k3
+        #   name: kimi-k3
+        #   contextWindow: 1048576
+        #   maxTokens: 131072
+        # 曾下架(2026-11-06~11-13,queues 404),2026-11-14 实测复活(queues
+        # 200、depth 0、ACTIVE,fnId 未变)。显示名带点,与 body 规范名一致。
         - id: moonshotai/kimi-k3_1-pro
-          name: kimi-k3_1-pro
+          name: kimi-k3.1-pro
           contextWindow: 1048576
           maxTokens: 131072
         - id: nvidia/ising-calibration-1-35b-a3b

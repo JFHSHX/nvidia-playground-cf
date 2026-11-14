@@ -200,6 +200,24 @@ Gateway 实现以此文件为准。
   nano-omni/laguna/llama-3.2-11b/ultra/gpt-oss-20b),diffusiongemma 1。拥堵是按函数的,
   小模型全空闲。
 
+## 函数下线特征(2026-11-06,kimi-k3_1-pro,fnId b79234a1-…)
+- 信号三件套(与 10-17 kimi-k3 下线同剧本,下架是分步的):
+  1. **queues 端点 HTTP 404**(最快信号,免费秒回),错误体点名
+     `404 Not Found from GET https://api.nvcf.nvidia.com/v2/nvcf/accounts/{acct}/queues/functions/{fnId}`;
+  2. **v2 predict 100% 失败**:captcha 正常铸出(6-8s 1 attempt)→ 等 120s →
+     `500 "Retries exhausted: 3/3"`(NVIDIA 网关 3 次内部重试全部进不了死函数);
+  3. **spec 端点仍 200**(fnId 不变)——目录层最后摘,spec 活≠模型可用。
+- **v3 对死函数的行为**:`/v3/predict/stateless/...` 同样接受 captcha、转发真上游,
+  envoy 30s 超时 → `504 from POST https://grpc.nvcf.nvidia.com/models/{ns}/{slug}`;
+  queues before/after 空。v3 无法区分"拥堵"和"函数已死"(都是 504/30s),
+  唯一区别只是失败快(v2 120s 慢死 / v3 30s 快死)。
+- 判活口诀:**查 queues 端点——404=函数被摘,有深度=活着,深度大=只是慢**。
+- 时间线参考:下线前夜 captcha no-pass 31-33s(函数挣扎期),凌晨 01:01/01:03
+  500 Retries exhausted,01:04 fetch failed,晨间 queues 404 定案。
+- **复活(2026-11-14,下线 8 天后)**:queues 200、depth 0、ACTIVE;**fnId 未变**
+  (仍 b79234a1-…),只换了 functionVersionId(→93718f7f-c6ff-4bb3-a9ff-b2650f063633)。
+  即 NVCF 函数可带原 fnId 复活,下架≠永别;queues 404 期间不要删快照条目。
+
 ## 成功样本抓包(2026-10-06,nemotron-3-super-120b-a12b,queueDepth 0)
 - 200 成功路径与失败路径**请求形状完全一致**(nv-function-id `ac74040f-…`、P1_ token、
   accept text/event-stream、Origin/Referer、无 Cookie/priority)——**成功也没有特殊路径**。

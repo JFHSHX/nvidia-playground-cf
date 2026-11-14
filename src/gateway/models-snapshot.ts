@@ -3,6 +3,10 @@
 // 已从目录页下架但 functionId/spec 仍活,保留待真正下线(实测时好时坏)。
 // 注意(2026-10-17 实测):kimi-k3 与 ising-calibration-1-35b-a3b 已被上游下架
 // (queues 端点 404、spec 无 functionVersionId),请求会得到 502 upstream 404。
+// 注意(2026-11-06 实测):kimi-k3_1-pro 曾下架(queues 404、predict 全 500、
+// v3 504),2026-11-14 实测复活(queues 200、depth 0、ACTIVE,fnId 未变)。
+// 判活口诀:查 queues 端点,404=函数被摘,有深度=活着
+// (详见 reference/upstream-protocol.md)。
 
 export const PREDICT_BASE = "https://buildapi.ngc.nvidia.com";
 export const DEFAULT_NAMESPACE = "qc69jvmznzxy";
@@ -83,6 +87,9 @@ export const MODEL_SNAPSHOT: Record<string, ModelInfo> = {
     functionId: "b79234a1-64e1-479e-87e7-1c8e3af74262",
     // 实测(2026-11-05):body 规范名带点;最小 body 200,DSH 风格参数(疑 top_p/
     // stop 等)400——与 kimi-k3 同族的严格校验,接入时注意
+    // 曾下架(2026-11-06~11-13,queues 404 函数被摘),2026-11-14 实测复活:
+    // queues 200、depth 0、ACTIVE、fnId 未变(只换 functionVersionId)。
+    // 复活后显示名用 kimi-k3.1-pro(带点,与 body 规范名一致)。
     model: "moonshotai/kimi-k3.1-pro",
   },
   "nvidia/ising-calibration-1-35b-a3b": {
