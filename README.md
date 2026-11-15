@@ -4,6 +4,8 @@
 
 移植自 [6Kmfi6HP/nvidia-playgroud-go](https://github.com/6Kmfi6HP/nvidia-playgroud-go)（Go + v8go），重写为 **Windows 原生 Node + Playwright**——全部求解/网关逻辑零运行时依赖（运行时仅 playwright）。
 
+发布版本与更新说明见 [GitHub Releases](https://github.com/JFHSHX/nvidia-playground-cf/releases)。
+
 ## 为什么不是 Cloudflare Workers
 
 原始目标是 CF Workers（仓库名由来），全部实测后否决（2026-10-03）：
@@ -89,10 +91,11 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 - **难度尖峰阶梯**：挑战难度由服务端定，尖峰挑战（s=17 → 2^34 章戳搜索）直接放弃重领，最多 3 轮；章戳搜索有 10s 预算护栏（`PowBudgetExceeded`）。
 - **no-pass 阵发自愈**：单模型连发也会触发 34-bit 阵发（升级针对单 lane 高频 claim，指纹池只分摊多模型负载）；实测 401 后 ~14s 即回 1-attempt ok——网关侧 no-pass 不立刻 401，退避 5s/10s 换新挑战重领（默认 3 轮），退避期间持 per-model 锁，顺带挡住同 lane 在尖峰窗口继续白耗求解。
 - **502 队列诊断**：上游 `Retries exhausted`（NVIDIA 网关 3×80s 内部重试失败）或 `Pool#acquire ... configured timeout`（后端连接池 45s 无执行槽）时自动查免认证 queues 端点，统一返回 `upstream_queue_overloaded`，502 错误体带 `queueDepth` 与实例状态。
+- **传输错误自愈与追踪**：上游 `fetch failed` 且尚未收到响应头时，等待 1s、换新的一次性 token 后仅重试 1 次；客户端自带 token 或请求已取消时不重放。请求、上游异常和流终止日志共享 `[req=…]`，同时返回 `x-request-id`；日志与 502 错误体保留 undici `cause` 的 code/errno/syscall 等底层原因。
 - **退化响应重试**：空 content / reasoning 单字符重复循环（"!!!!…"）检出即整条废弃换新 token 重试，最多 2 次；SSE 在头部 reasoning delta 到达客户端前拦截。
 - **流中止防护**：上游 h2 流中止/客户端断开不炸进程（undici "terminated" 竞态降级为日志）；客户端断开主动断上游流。
 - **每模型字段清洗**：如 kimi-k3.1-pro 拒收 `top_p/stop/presence_penalty/frequency_penalty`（400，UI 从不发送）——按 canonicalModel 剥掉（`MODEL_STRIP_FIELDS`）。
-- **文件日志**：`logs/npg-YYYY-MM-DD.log`（每日滚动），含每次 captcha 求解（lane/指纹变体/耗时）与每请求模型 + 状态码。
+- **文件日志**：`logs/npg-YYYY-MM-DD.log`（每日滚动），含每次 captcha 求解（lane/指纹变体/耗时）与每请求 ID + 模型 + 状态码；传输错误额外记录底层 cause。
 
 ## 配置（环境变量）
 
@@ -138,7 +141,7 @@ OpenAI 请求 → node:http (8787, per-model 节流队列)
 | `npx tsx scripts/verify-fp-pool.ts` | 指纹池自测 13/13（确定性/变体差异/lane 粘性/默认 2） |
 | `npx tsx scripts/verify-stamp-pool.ts` | 多核章戳池自测（格式/checkStamp/事件循环不冻结/多核加速对比） |
 | `npx tsx scripts/verify-token-pool.ts` | token 滴灌池自测（懒启动/命中/单 in-flight/失败/过期/空闲） |
-| `npx tsx scripts/verify-reliability.ts` | P0/P1 回归（活默认模型/Pool#acquire 诊断/完整错误体日志） |
+| `npx tsx scripts/verify-reliability.ts` | 可靠性回归（活默认模型/Pool#acquire 诊断/完整错误体/fetch cause + 一次安全重试） |
 | `npx tsx scripts/probe-predict.ts [model]` | 自铸 token 直连 v2 predict，A/B/C… 变体字段二分定位 400 |
 | `npx tsx scripts/probe-v3.ts [model]` | V3 stateless 路径探测（已证同队列、30s 快失败） |
 | `npx tsx scripts/list-models.ts` | 真浏览器抓 playground 目录，对比快照发现新模型 |

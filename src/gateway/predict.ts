@@ -282,6 +282,27 @@ async function queueDepthHint(info: ModelInfo): Promise<string> {
   }
 }
 
+function errorDetail(value: unknown): string {
+  const record = value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+  const name = value instanceof Error ? value.name : typeof record.name === "string" ? record.name : "";
+  const message = value instanceof Error
+    ? value.message
+    : typeof record.message === "string" ? record.message : String(value);
+  const fields = ["code", "errno", "syscall", "address", "port"]
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${key}=${String(record[key])}`);
+  return `${name ? `${name}: ` : ""}${message}${fields.length > 0 ? ` (${fields.join(", ")})` : ""}`;
+}
+
+/** fetch 的 TypeError 本身只有 "fetch failed";undici 把 socket/TLS 原因放在 cause。 */
+export function formatFetchError(err: unknown): string {
+  const top = errorDetail(err);
+  const cause = err !== null && typeof err === "object" ? (err as { cause?: unknown }).cause : undefined;
+  return cause === undefined ? top : `${top}; cause: ${errorDetail(cause)}`;
+}
+
+const FETCH_RETRY_DELAY_MS = 1000;
+
 /**
  * 执行 predict:POST 端点,重试可重试 captcha 失败(换新 token)。返回 status < 400 的
  * 上游 Response;失败抛 GatewayError(400/401/408/502/503)。
@@ -293,12 +314,15 @@ export async function doPredict(
   clientToken: string,
   acquireCaptcha: AcquireCaptcha,
   signal?: AbortSignal,
+  requestId = "-",
 ): Promise<Response> {
   const maxAttempts = clientToken !== "" ? 1 : PREDICT_ATTEMPTS_WITH_POOL;
   const endpoint = predictEndpoint(info);
 
   let lastUpstreamMessage = "";
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  let fetchRetried = false;
+  // 传输重试只增加一个循环槽;HTTP/captcha 的重试上限仍由 maxAttempts 约束。
+  for (let attempt = 1; attempt <= maxAttempts + (fetchRetried ? 1 : 0); attempt++) {
     let token = clientToken;
     if (token === "") {
       let acquired: { captchaToken: string } | null = null;
@@ -334,6 +358,7 @@ export async function doPredict(
     }
 
     let resp: Response;
+    const fetchStartedAt = Date.now();
     try {
       resp = await fetch(endpoint, {
         method: "POST",
@@ -346,7 +371,25 @@ export async function doPredict(
         throw new GatewayError(504, "upstream_timeout", "upstream request timed out");
       }
       const msg = err instanceof Error ? err.message : String(err);
-      throw new GatewayError(502, "upstream_error", `upstream: ${msg}`);
+      const details = formatFetchError(err);
+      const elapsed = Date.now() - fetchStartedAt;
+      const canRetry = msg === "fetch failed" && clientToken === "" && !fetchRetried;
+      console.error(
+        `[npg-gw] predict fetch failed [req=${requestId}] [${info.slug}] attempt=${attempt} elapsed=${elapsed}ms: ${details}`,
+      );
+      if (canRetry) {
+        fetchRetried = true;
+        console.error(
+          `[npg-gw] transport retry 1/1 in ${FETCH_RETRY_DELAY_MS}ms [req=${requestId}] [${info.slug}]: fresh captcha token`,
+        );
+        await new Promise((r) => setTimeout(r, FETCH_RETRY_DELAY_MS));
+        if (signal?.aborted) {
+          throw new GatewayError(504, "upstream_timeout", "upstream request timed out during transport retry wait");
+        }
+        continue; // fetch 未返回 Response(未收到响应头);下一次循环重新领取一次性 token。
+      }
+      // 客户端自带 token 不能换发,无法安全重试;其他异常也不盲目重放。
+      throw new GatewayError(502, "upstream_error", `upstream: ${details}`);
     }
 
     if (resp.status < 400) return resp;

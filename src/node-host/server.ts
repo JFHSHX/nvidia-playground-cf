@@ -140,9 +140,10 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function writeResponse(resp: Response, res: http.ServerResponse): Promise<void> {
+async function writeResponse(resp: Response, res: http.ServerResponse, requestId: string): Promise<void> {
   const headers: Record<string, string> = {};
   resp.headers.forEach((value, key) => { headers[key] = value; });
+  headers["x-request-id"] = requestId;
   res.writeHead(resp.status, headers);
   if (!resp.body) { res.end(); return; }
   // Stream the body (SSE passthrough stays chunk-by-chunk).
@@ -151,7 +152,7 @@ async function writeResponse(resp: Response, res: http.ServerResponse): Promise<
   // "terminated" 中止竞态逃逸成 uncaughtException。body 错误 → 干净收尾客户端
   // 响应;客户端先断 → 主动破坏上游流(不再白耗上游算力)。
   body.on("error", (err) => {
-    console.error(`[npg] upstream body terminated mid-stream: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[npg] upstream body terminated mid-stream [req=${requestId}]: ${err instanceof Error ? err.message : String(err)}`);
     if (!res.writableEnded) res.destroy();
   });
   res.on("close", () => {
@@ -213,10 +214,12 @@ function throttleFor<T>(model: string, work: () => Promise<T>): Promise<T> {
 
 const server = http.createServer(async (req, res) => {
   const t0 = Date.now();
+  const requestId = crypto.randomUUID();
   let laneModel = ""; // 请求的模型(body "model"),finish 日志带上以便关联 401/502
-  res.on("finish", () => console.log(`req ${req.method} ${req.url}${laneModel ? ` [${laneModel}]` : ""} -> ${res.statusCode} ${Date.now() - t0}ms`));
+  res.on("finish", () => console.log(`req ${req.method} ${req.url} [req=${requestId}]${laneModel ? ` [${laneModel}]` : ""} -> ${res.statusCode} ${Date.now() - t0}ms`));
   const url = new URL(req.url ?? "/", "http://localhost");
   withCors(res);
+  res.setHeader("x-request-id", requestId);
   try {
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     if (url.pathname === "/healthz") {
@@ -251,7 +254,7 @@ const server = http.createServer(async (req, res) => {
         headers: { "content-type": "application/json" },
         body,
       });
-      let resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
+      let resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq(), requestId));
       // 可重试的模型方差失败:(a) 空 content;(b) reasoning 重复字符退化
       // ("!!!!…" ×N,dsh 实测触发 harness 的 degenerated 判定)。非流式:
       // 全量检测;SSE:头部扫描(reasoning delta 在到达客户端前拦截)。
@@ -259,10 +262,10 @@ const server = http.createServer(async (req, res) => {
       for (let retry = 1; retry <= 2; retry++) {
         const guarded = await degenerateGuard(resp);
         if (guarded) { resp = guarded; break; }
-        console.error(`[npg] degenerate response (empty content or repetition-loop reasoning), retry ${retry}/2 [${reqModel}]`);
-        resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq()));
+        console.error(`[npg] degenerate response (empty content or repetition-loop reasoning), retry ${retry}/2 [${reqModel}] [req=${requestId}]`);
+        resp = await throttleFor(reqModel, () => handleChatCompletions(makeReq(), requestId));
       }
-      await writeResponse(resp, res);
+      await writeResponse(resp, res, requestId);
       return;
     }
     res.writeHead(404, { "content-type": "application/json" });

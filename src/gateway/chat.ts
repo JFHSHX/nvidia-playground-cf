@@ -290,19 +290,19 @@ interface ChatCompletionRequest {
   [key: string]: unknown;
 }
 
-function jsonError(err: unknown): Response {
+function jsonError(err: unknown, requestId = ""): Response {
   const body = JSON.stringify(openAIErrorBody(err));
   const status = err instanceof GatewayError ? err.status : 400;
   // 把错误体进日志:401/502 的上游原因需要完整记录才能诊断间歇性失败。
-  console.error(`[npg-gw] error ${status}: ${body}`);
+  console.error(`[npg-gw] error ${status}${requestId ? ` [req=${requestId}]` : ""}: ${body}`);
   return new Response(body, {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(requestId ? { "x-request-id": requestId } : {}) },
   });
 }
 
 /** GET/POST /v1/chat/completions 入口。返回 Response(index.ts 加 CORS)。 */
-export async function handleChatCompletions(request: Request): Promise<Response> {
+export async function handleChatCompletions(request: Request, requestId = crypto.randomUUID()): Promise<Response> {
   if (request.method !== "POST") {
     return jsonError(new GatewayError(405, "method_not_allowed", "method not allowed; use POST"));
   }
@@ -360,10 +360,10 @@ export async function handleChatCompletions(request: Request): Promise<Response>
   const controller = stream ? undefined : abortAfterTimeout(NON_STREAM_TIMEOUT_MS);
   let upstream: Response;
   try {
-    upstream = await doPredict(target.info, upstreamBody, clientToken, acquire, controller?.signal);
+    upstream = await doPredict(target.info, upstreamBody, clientToken, acquire, controller?.signal, requestId);
   } catch (err) {
     controller?.abort();
-    return jsonError(err);
+    return jsonError(err, requestId);
   }
 
   if (stream) {
