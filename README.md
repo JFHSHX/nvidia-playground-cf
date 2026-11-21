@@ -6,15 +6,6 @@
 
 发布版本与更新说明见 [GitHub Releases](https://github.com/JFHSHX/nvidia-playground-cf/releases)。
 
-## 为什么不是 Cloudflare Workers
-
-原始目标是 CF Workers（仓库名由来），全部实测后否决（2026-10-03）：
-
-- **workerd 禁止运行时 wasm 代码生成**（`Wasm code generation disallowed by embedder`）——hsw bundle 在运行时从 atob() 块组装 wasm，物理不可能；Worker Loader 还要 Paid 计划（code 10195）。
-- **当前 hsw wasm 在一切 JS 嵌入器里解算挂死**（`RuntimeError: unreachable`）：v8go（Go 版容器日志同样 `hsw: solve timed out`）、Node vm、workerd 全中招——只有真实浏览器正常。
-
-→ 转向 Node 原生 + headless Chromium 解算。`src/index.ts` + `wrangler.toml` 保留 workerd 版仅作参考。
-
 ## 运行
 
 ```powershell
